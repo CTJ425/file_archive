@@ -1,0 +1,7 @@
+# make_testdata.sh 產生的測試資料（勿入庫）
+/testfile/
+/raw/
+
+# 執行期產物
+/logs/
+*.log
