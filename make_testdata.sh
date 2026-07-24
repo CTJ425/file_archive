@@ -110,7 +110,8 @@ ask_date() {  # $1=提示  $2=預設 → stdout YYYY-MM-DD
 # --- 1. 位置 ------------------------------------------------------------------
 echo "===== 1/3 位置 ====="
 ROOT="$(ask "測試資料要產生在哪個目錄" "$ROOT")"
-ROOT="${ROOT%/}"
+# 尾斜線剝到底（"///" 只剝一層會變 "//" 而繞過下面的根目錄檢查）
+while [ "$ROOT" != "/" ] && [ "${ROOT%/}" != "$ROOT" ]; do ROOT="${ROOT%/}"; done
 
 # 安全檢查：這個目錄等一下會被清空，絕不能是根目錄或掛載點
 case "$ROOT" in
@@ -144,6 +145,14 @@ DATE_TO="$(ask_date "資料結束日期" "$DATE_TO")"
 if [ "$(date -d "$DATE_FROM" +%s)" -gt "$(date -d "$DATE_TO" +%s)" ]; then
     echo "  ！起始日晚於結束日，自動對調" >&2
     _t="$DATE_FROM"; DATE_FROM="$DATE_TO"; DATE_TO="$_t"
+fi
+# 未來日期的檔 mtime 比封存基準新、不會被搬，但會被算進「應搬移」讓對帳失準 → 壓回今天
+if [ "$(date -d "$DATE_TO" +%s)" -gt "$(date -d "$TODAY" +%s)" ]; then
+    echo "  ！結束日期在未來，已改為今天 $TODAY（未來的檔不會被封存，對帳會失準）" >&2
+    DATE_TO="$TODAY"
+fi
+if [ "$(date -d "$DATE_FROM" +%s)" -gt "$(date -d "$TODAY" +%s)" ]; then
+    DATE_FROM="$TODAY"
 fi
 
 if ask_yn "額外加入今天($TODAY)的資料（驗證「今天的不搬」）" "$INCLUDE_TODAY"; then
@@ -246,9 +255,14 @@ for d in $dates; do
         esac
         rnd "$FILES_MIN" "$FILES_MAX"; cnt=$RND
         for _ in $(seq 1 "$cnt"); do
-            rand_time; t="$RT"
-            hh="${t%%:*}"; rest="${t#*:}"; mm="${rest%%:*}"; ss="${rest##*:}"
-            fname="${CAM}_${d}_${hh}H-${mm}M-${ss}S.$kind"
+            # 同一天抽到同一秒會同名覆寫，讓上面的計數與實際檔數對不上 → 重抽到不重複
+            # （同一種子下重抽序列也固定，不影響可重現性；FILES_MAX 上限 1000 << 86400 秒，必能抽到）
+            while :; do
+                rand_time; t="$RT"
+                hh="${t%%:*}"; rest="${t#*:}"; mm="${rest%%:*}"; ss="${rest##*:}"
+                fname="${CAM}_${d}_${hh}H-${mm}M-${ss}S.$kind"
+                [ -e "$ROOT/$sub/$d/$fname" ] || break
+            done
             rnd "$SIZE_MIN_KB" "$SIZE_MAX_KB"; kb=$RND
             mkfile "$ROOT/$sub/$d/$fname" "$kb" "$d $t"
             if [ "$d" = "$TODAY" ]; then n_keep=$((n_keep+1)); else n_move=$((n_move+1)); fi
@@ -290,6 +304,6 @@ if [ "$MAKE_OLD" = y ]; then
     printf '  應記 SKIPOLD : %s 檔（%s，超過保留期，不搬也不刪）\n' "$n_skip" "$old_date"
 fi
 echo
-echo "  提示：sync_archive.sh 要求來源必須是掛載點。本機驗證可用"
-echo "        sudo mount --bind $ROOT $ROOT"
+echo "  提示：conf 設 REQUIRE_MOUNTPOINT=0（預設）時可直接對本機資料夾執行；"
+echo "        設 1 時來源必須是掛載點，本機驗證可用 sudo mount --bind $ROOT $ROOT"
 echo "        （注意：掛載後本腳本會拒絕再對同一路徑產生資料，需先 umount）"

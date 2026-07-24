@@ -2,6 +2,13 @@
 /testfile/
 /raw/
 
+# 本機測試用的來源/封存/log 目錄（conf 指向這裡時產生，勿入庫）
+/src_dir/
+/dst_dir/
+/logs_dir/
+
 # 執行期產物
 /logs/
 *.log
+summary.tsv
+summary_time.html

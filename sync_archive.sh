@@ -34,6 +34,14 @@ fi
 # shellcheck source=/dev/null
 . "$CONF"
 
+# 必要變數檢查：漏定義時給明確錯誤，而不是讓 set -u 丟出難懂的 unbound variable
+for _v in SRC DST LOG_DIR; do
+    if [ -z "${!_v:-}" ]; then
+        echo "ERROR: 設定檔缺少必要變數 $_v: $CONF" >&2
+        exit 2
+    fi
+done
+
 # 去掉路徑尾端斜線：mountpoint 不在時的 fallback 是比對 `mount` 輸出的
 # " on <路徑> "，帶尾斜線會比不到而誤判成「未掛載」。
 while [ "$SRC" != "/" ] && [ "${SRC%/}" != "$SRC" ]; do SRC="${SRC%/}"; done
@@ -45,6 +53,7 @@ while [ "$DST" != "/" ] && [ "${DST%/}" != "$DST" ]; do DST="${DST%/}"; done
 : "${LOG_RETENTION_DAYS:=90}"
 : "${DRY_RUN:=0}"
 : "${NOTIFY_ON_ERROR:=0}"
+: "${REQUIRE_MOUNTPOINT:=0}"
 
 # --- 準備 log 與統計變數 ------------------------------------------------------
 mkdir -p "$LOG_DIR" 2>/dev/null
@@ -198,14 +207,29 @@ fi
 CUTOFF="$(date -d "00:00:00 today - ${ARCHIVE_BEFORE_DAYS_AGO} days" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
 [ -n "$CUTOFF" ] || die "無法計算基準日（date -d 不支援？）"
 
-log "START  src=$SRC dst=$DST dry_run=$DRY_RUN 封存基準=<$CUTOFF 之前> retention=${RETENTION_DAYS}d"
+# 保留期基準也在開跑時「定格」成一個固定時間點，搬移清單與 $DST 保留刪除
+# 共用同一個值。若沿用 -mtime +N（相對「當下」計算），rsync 跑數小時的大批
+# 首搬會讓兩個階段各自看到不同的「當下」——掃描時未過期的檔案，到保留階段
+# 可能剛好跨過期限，於同一輪被「搬過去 → 立刻刪掉」，靜默遺失。
+# 換算：-mtime +N 命中「年齡 ≥ (N+1)*24h」的檔，故定格點 = 開跑時刻 - (N+1) 天，
+# 語義與原本完全相同，只是凍結在 START_TS 不再隨執行時間漂移。
+RET_CUTOFF="$(date -d "@$(( START_TS - (RETENTION_DAYS + 1) * 86400 ))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
+[ -n "$RET_CUTOFF" ] || die "無法計算保留基準（date -d 不支援？）"
+
+log "START  src=$SRC dst=$DST dry_run=$DRY_RUN 封存基準=<$CUTOFF 之前> retention=${RETENTION_DAYS}d 保留基準=<$RET_CUTOFF 之前刪>"
 
 # --- 前置健康檢查 -------------------------------------------------------------
-if command -v mountpoint >/dev/null 2>&1; then
-    mountpoint -q "$SRC" || die "來源不是掛載點或未掛載: $SRC"
-else
-    mount | grep -q " on $SRC " || die "來源未在 mount 清單中: $SRC"
+# REQUIRE_MOUNTPOINT=1：要求 $SRC 必須是掛載點。CIFS 部署建議開啟——分享夾沒掛上時
+#   掛載點只是個空目錄，不擋下來會誤以為「沒東西可搬」而靜默空轉。
+# REQUIRE_MOUNTPOINT=0（預設）：來源是本機資料夾的情境，只要求目錄存在即可。
+if [ "$REQUIRE_MOUNTPOINT" = 1 ]; then
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$SRC" || die "來源不是掛載點或未掛載: $SRC"
+    else
+        mount | grep -qF " on $SRC " || die "來源未在 mount 清單中: $SRC"
+    fi
 fi
+[ -d "$SRC" ] || die "來源目錄不存在: $SRC"
 mkdir -p "$DST" 2>/dev/null
 _probe="$DST/.write_test_$$"
 if ! ( : > "$_probe" ) 2>/dev/null; then
@@ -218,15 +242,15 @@ cd "$SRC" || die "無法進入來源目錄: $SRC"
 
 # 待搬清單：mtime 早於基準日（! -newermt = 不比基準新 = 基準日之前），
 # 但還沒老到「一搬過去就會被保留期刪掉」；排除暫存檔。
-# 這裡的 -mtime +RETENTION_DAYS 與下方 $DST 保留刪除用的是同一個判斷式，
+# 這裡與下方 $DST 保留刪除用的是同一個定格的 $RET_CUTOFF，
 # 確保兩者邊界一致 —— 否則超過保留期的檔會被搬到 $DST 後於同一輪立刻刪除，
 # 來源與封存同時消失，造成靜默的資料遺失。
-find . -type f ! -newermt "$CUTOFF" ! -mtime +"$RETENTION_DAYS" \
+find . -type f ! -newermt "$CUTOFF" -newermt "$RET_CUTOFF" \
     ! -name '*.tmp' -print0 > "$FILELIST"
 
 # 過舊清單：只記錄與統計，不搬移也不刪除，原地留在來源等人工判斷。
 # （保留期刪除永遠只作用於 $DST，絕不對來源動刀）
-find . -type f ! -newermt "$CUTOFF" -mtime +"$RETENTION_DAYS" \
+find . -type f ! -newermt "$CUTOFF" ! -newermt "$RET_CUTOFF" \
     ! -name '*.tmp' -print0 > "$SKIPLIST"
 
 MOVE_COUNT=$(tr -cd '\0' < "$FILELIST" | wc -c)
@@ -269,18 +293,18 @@ if [ "$MOVE_COUNT" -gt 0 ]; then
     fi
 fi
 
-# --- 保留階段（只對 $DST，依原始 mtime） -------------------------------------
+# --- 保留階段（只對 $DST，依原始 mtime；用定格的 $RET_CUTOFF，與搬移清單同基準）
 if [ "$DRY_RUN" = 1 ]; then
     log "DRYRUN 以下為將刪除（>${RETENTION_DAYS}天）清單（未實際刪除）"
     while IFS=' ' read -r sz path; do
         log "DELETE $sz $path"
         DEL_COUNT=$(( DEL_COUNT + 1 )); DEL_BYTES=$(( DEL_BYTES + sz ))
-    done < <(find "$DST" -type f -mtime +"$RETENTION_DAYS" -printf '%s %p\n' 2>/dev/null)
+    done < <(find "$DST" -type f ! -newermt "$RET_CUTOFF" -printf '%s %p\n' 2>/dev/null)
 else
     while IFS=' ' read -r sz path; do
         log "DELETE $sz $path"
         DEL_COUNT=$(( DEL_COUNT + 1 )); DEL_BYTES=$(( DEL_BYTES + sz ))
-    done < <(find "$DST" -type f -mtime +"$RETENTION_DAYS" -printf '%s %p\n' -delete 2>/dev/null)
+    done < <(find "$DST" -type f ! -newermt "$RET_CUTOFF" -printf '%s %p\n' -delete 2>/dev/null)
     find "$DST" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 fi
 
