@@ -2,16 +2,23 @@
 # ============================================================================
 # sync_archive.sh
 #
-# 用途：在 Synology DSM 上，把「透過 CIFS 掛載的 A PC 分享夾」中的 IPCAM 影片/PDF
-#       安全搬移（copy → verify → delete source）到 NAS 本機封存目錄，並清除
-#       NAS 上超過保留期限的舊檔。每次執行寫入每日封存 log（txt）並更新一份
-#       易讀的 summary_time.html。
+# 用途：在 Synology DSM 上，把來源（透過 CIFS 掛載的 A PC 分享夾，或本機資料夾）
+#       中的 IPCAM 影片/PDF 安全搬移（copy → verify → delete source）到 NAS 本機
+#       封存目錄，並清除 NAS 上超過保留期限的舊檔。每次執行寫入每日封存 log（txt）
+#       並更新一份易讀的 summary_time.html。
+#
+# 兩階段職責分開：
+#   1. 封存階段（SRC → DST）：只負責搬移，完全不做保留期判斷。目標單純是
+#      釋放來源空間、NAS 上有一份。
+#   2. 保留階段（只對 DST）：檔案該不該留，一律在 NAS 上決定。
+#   因此來源上已超過保留期的舊檔會照樣搬過去、再由保留階段刪除（log 兩筆都留）。
 #
 # 設計要點：
 #   - 以 rsync --remove-source-files 達成「類似 mv」的安全語義：每個檔完整成功
 #     傳輸後才刪來源，中途失敗只保留來源、不遺失資料。
 #   - 只搬「基準日 00:00 之前」的檔（以檔案 mtime 判斷），今天產生中的檔不碰。
-#   - 掛載/哨兵健康檢查失敗即中止，絕不因來源「看起來是空的」而誤動作。
+#   - 來源健康檢查失敗只跳過封存階段並記 ERROR，$DST 的保留期清理照常執行
+#     （否則來源離線多久，NAS 就有多久不清理），最後仍以非零結束並發通知。
 #   - 保留刪除只作用於 $DST（本機），程式碼層級與來源分離，杜絕誤刪來源。
 #   - flock 單一實例鎖，避免排程重疊。
 #
@@ -54,14 +61,6 @@ while [ "$DST" != "/" ] && [ "${DST%/}" != "$DST" ]; do DST="${DST%/}"; done
 : "${DRY_RUN:=0}"
 : "${NOTIFY_ON_ERROR:=0}"
 : "${REQUIRE_MOUNTPOINT:=0}"
-: "${OVER_RETENTION_POLICY:=keep}"
-
-# 來源上「搬過去也已超過保留期」的檔案要怎麼處理（三選一）
-case "$OVER_RETENTION_POLICY" in
-    keep|archive|skip) ;;
-    *) echo "ERROR: OVER_RETENTION_POLICY 只能是 keep / archive / skip，目前為: $OVER_RETENTION_POLICY" >&2
-       exit 2 ;;
-esac
 
 # --- 準備 log 與統計變數 ------------------------------------------------------
 mkdir -p "$LOG_DIR" 2>/dev/null
@@ -70,18 +69,24 @@ SUMMARY_TSV="$LOG_DIR/summary.tsv"
 SUMMARY_HTML="$LOG_DIR/summary_time.html"
 LOCKFILE="$LOG_DIR/.sync_archive.lock"
 FILELIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive.XXXXXX")"
-OLDLIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive_old.XXXXXX")"
-RSYNCLIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive_rsync.XXXXXX")"
 
-# 豁免保留期刪除的清單（相對 $DST 的路徑，NUL 分隔）。
-# 刻意放在 $DST 內而非 LOG_DIR：這份紀錄必須與封存資料同生共死 —— 若放 log 目錄
-# 而被清掉，那些「刻意永久保留」的檔案會在下一輪被保留期靜默刪除。
-KEEP_LEDGER="$DST/.keepold.list"
+# 逐檔明細：每次執行累積到暫存檔，成功收尾時才落地成 details/<執行時間>.tsv，
+# 供 summary_time.html 產生可展開的細項。格式：動作<TAB>位元組<TAB>路徑
+DETAIL_DIR="$LOG_DIR/details"
+DETAIL_TMP="$(mktemp "${TMPDIR:-/tmp}/sync_detail.XXXXXX")"
+RSYNC_OUT="$(mktemp "${TMPDIR:-/tmp}/sync_rsyncout.XXXXXX")"
+DETAIL_RUNS=30        # HTML 中 embed 明細的執行筆數（同時也是 details/ 保留的檔數）
+DETAIL_MAX_LINES=2000 # 單次執行最多保留幾筆明細，避免大量搬移時檔案爆掉
+# 每次執行的唯一識別（時間＋PID）。不能只用時間 —— 同一秒內結束的兩次執行會撞名，
+# 導致後者覆蓋前者、或兩列摘要指向同一份明細。
+RUN_ID="$(date '+%Y%m%d_%H%M%S')_$$"
+
+detail() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$DETAIL_TMP" 2>/dev/null; }
 
 # 供 summary 使用的全域統計（die 也會用到）
 MOVE_COUNT=0; MOVE_BYTES=0; DEL_COUNT=0; DEL_BYTES=0; RC=0
-SKIP_COUNT=0; SKIP_BYTES=0; KEEP_COUNT=0; KEEP_BYTES=0
-OLD_COUNT=0; OLD_BYTES=0
+# 來源不健康（未掛載／目錄不存在）時設為 1：跳過封存階段，但保留階段照跑
+SRC_UNAVAILABLE=0; SRC_ERR=""
 START_TS=$(date +%s)
 
 log()  { echo "$(date '+%F %T')  $*" >> "$LOG"; }
@@ -99,20 +104,47 @@ human() {
 append_summary() {
     local status="$1"
     local dur=$(( $(date +%s) - START_TS ))
-    # 新欄位一律追加在 status 之後（跳過=第10欄、豁免=第11欄），
-    # 舊格式的 9 / 10 欄紀錄仍可正常讀取
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$(date '+%F %T')" "$MOVE_COUNT" "$MOVE_BYTES" \
-        "$DEL_COUNT" "$DEL_BYTES" "$RC" "$dur" "$DRY_RUN" "$status" \
-        "$SKIP_COUNT" "$KEEP_COUNT" \
+    local ts; ts="$(date '+%F %T')"
+    # 第 10 欄放 RUN_ID 供 HTML 找到對應明細檔。舊紀錄的第 10 欄是已停用的
+    # skipped 計數，會被當成找不到的 RUN_ID → 該列單純不可展開，不會錯亂。
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        "$ts" "$MOVE_COUNT" "$MOVE_BYTES" \
+        "$DEL_COUNT" "$DEL_BYTES" "$RC" "$dur" "$DRY_RUN" "$status" "$RUN_ID" \
         >> "$SUMMARY_TSV" 2>/dev/null
+
+    if [ -s "$DETAIL_TMP" ]; then
+        mkdir -p "$DETAIL_DIR" 2>/dev/null
+        local dfile total
+        dfile="$DETAIL_DIR/$RUN_ID.tsv"
+        total=$(wc -l < "$DETAIL_TMP")
+        if [ "$total" -gt "$DETAIL_MAX_LINES" ]; then
+            head -n "$DETAIL_MAX_LINES" "$DETAIL_TMP" > "$dfile" 2>/dev/null
+            printf 'TRUNCATED\t0\t（僅顯示前 %s 筆，本次共 %s 筆，完整紀錄見 %s）\n' \
+                "$DETAIL_MAX_LINES" "$total" "${LOG##*/}" >> "$dfile" 2>/dev/null
+        else
+            cp "$DETAIL_TMP" "$dfile" 2>/dev/null
+        fi
+        # 只留最近 DETAIL_RUNS 份，與 HTML 實際會展開的筆數一致
+        ls -1t "$DETAIL_DIR"/*.tsv 2>/dev/null | tail -n +$(( DETAIL_RUNS + 1 )) \
+            | while IFS= read -r _old; do rm -f "$_old" 2>/dev/null; done
+    fi
+
     render_summary_html
 }
 
+# HTML 逸出：路徑可能含 & < > 等字元，直接塞進 HTML 會破壞版面甚至截斷內容
+html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+
 # 由 SUMMARY_TSV 產生自足（inline CSS、支援深/淺色）的 summary_time.html
+#
+# 只在每次執行「收尾」時呼叫（append_summary），且先寫暫存檔再 mv 過去 ——
+# mv 是同檔案系統上的原子操作，使用者永遠不會看到寫到一半的頁面，也不會在
+# 搬移還在跑的時候看到半套數字而誤判。
 render_summary_html() {
     [ -f "$SUMMARY_TSV" ] || return 0
     local rows; rows="$(tail -n 200 "$SUMMARY_TSV" | tac)"
+    local out_tmp="$SUMMARY_HTML.tmp.$$"
+    local row_idx=0
     {
         cat <<'HTML_HEAD'
 <!doctype html>
@@ -124,25 +156,55 @@ render_summary_html() {
 @media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#9198a1;--bd:#30363d;--ok:#3fb950;--err:#f85149;--dry:#d29922;--hd:#21262d}}
 *{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif}
 h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);font-size:13px;margin-bottom:20px}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow:hidden;max-width:1000px;margin:0 auto}
-.wrap{overflow-x:auto}table{border-collapse:collapse;width:100%;font-size:14px}
-th,td{padding:10px 14px;text-align:left;white-space:nowrap;border-bottom:1px solid var(--bd)}
-th{background:var(--hd);color:var(--mut);font-weight:600;position:sticky;top:0}
-td.num{text-align:right;font-variant-numeric:tabular-nums}
-tr:last-child td{border-bottom:none}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow:hidden;max-width:1040px;margin:0 auto}
+.wrap{overflow-x:auto}
+.grid{min-width:900px}
+.row{display:grid;grid-template-columns:165px 108px 88px 96px 88px 96px 66px 72px;
+     align-items:center;gap:0;font-size:14px}
+.row>span{padding:10px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row>span.num{text-align:right;font-variant-numeric:tabular-nums}
+.hdr{background:var(--hd);color:var(--mut);font-weight:600;border-bottom:1px solid var(--bd);
+     position:sticky;top:0;z-index:1}
+details.run{border-bottom:1px solid var(--bd)}
+details.run:last-of-type{border-bottom:none}
+details.run>summary{list-style:none;cursor:pointer}
+details.run>summary::-webkit-details-marker{display:none}
+details.run>summary:hover{background:color-mix(in srgb,var(--fg) 4%,transparent)}
+details.run[open]>summary{background:color-mix(in srgb,var(--fg) 6%,transparent)}
+/* 沒有明細可看的列：外觀一致但不可展開，也不給游標暗示 */
+.norow{border-bottom:1px solid var(--bd)}.norow:last-child{border-bottom:none}
+.caret{display:inline-block;width:12px;color:var(--mut);transition:transform .15s}
+details.run[open] .caret{transform:rotate(90deg)}
+.det{padding:4px 14px 14px;background:color-mix(in srgb,var(--fg) 3%,transparent)}
+.det table{border-collapse:collapse;width:100%;font-size:12.5px;
+           font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+.det th,.det td{padding:4px 8px;text-align:left;border-bottom:1px solid var(--bd);white-space:nowrap}
+.det td.p{white-space:normal;word-break:break-all;font-family:inherit}
+.det td.n{text-align:right;font-variant-numeric:tabular-nums;color:var(--mut)}
+.det tr:last-child td{border-bottom:none}
+.det .scroll{max-height:420px;overflow:auto}
+.act{display:inline-block;padding:1px 7px;border-radius:4px;font-size:11px;font-weight:600}
+.a-mv{color:var(--ok);background:color-mix(in srgb,var(--ok) 14%,transparent)}
+.a-dl{color:var(--err);background:color-mix(in srgb,var(--err) 14%,transparent)}
+.a-tr{color:var(--dry);background:color-mix(in srgb,var(--dry) 14%,transparent)}
+.nodet{color:var(--mut);font-size:12.5px;padding:10px 2px}
 .badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}
 .b-ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 15%,transparent)}
 .b-err{color:var(--err);background:color-mix(in srgb,var(--err) 15%,transparent)}
 .b-dry{color:var(--dry);background:color-mix(in srgb,var(--dry) 15%,transparent)}
-.foot{color:var(--mut);font-size:12px;text-align:center;margin:16px auto 0;max-width:1000px}
+.foot{color:var(--mut);font-size:12px;text-align:center;margin:16px auto 0;max-width:1040px}
 </style></head><body>
 <h1>Synology Sync — 執行摘要</h1>
 HTML_HEAD
-        echo "<div class=\"sub\">最後更新：$(date '+%F %T')　·　來源 <code>${SRC}</code> → 封存 <code>${DST}</code>　·　顯示最近 200 筆</div>"
-        echo '<div class="card"><div class="wrap"><table>'
-        echo '<thead><tr><th>執行時間</th><th>狀態</th><th class="num">搬移檔數</th><th class="num">搬移量</th><th class="num">刪除檔數</th><th class="num">釋放量</th><th class="num">跳過(過舊)</th><th class="num">豁免保留</th><th class="num">rsync</th><th class="num">耗時</th></tr></thead><tbody>'
-        while IFS=$'\t' read -r dt mc mb dc db rc dur dry status skipped kept; do
+        echo "<div class=\"sub\">最後更新：$(date '+%F %T')　·　來源 <code>$(printf '%s' "$SRC" | html_escape)</code> → 封存 <code>$(printf '%s' "$DST" | html_escape)</code>　·　顯示最近 200 筆，點列可展開逐檔明細</div>"
+        echo '<div class="card"><div class="wrap"><div class="grid">'
+        echo '<div class="row hdr"><span>執行時間</span><span>狀態</span><span class="num">搬移檔數</span><span class="num">搬移量</span><span class="num">刪除檔數</span><span class="num">釋放量</span><span class="num">rsync</span><span class="num">耗時</span></div>'
+        # 第 10 欄＝RUN_ID（舊紀錄是已停用的 skipped 計數，找不到明細檔而已）。
+        # legacy 這個變數是為了吃掉舊紀錄的第 11 欄，少讀會讓它被併進 status 造成錯亂。
+        # shellcheck disable=SC2034
+        while IFS=$'\t' read -r dt mc mb dc db rc dur dry status runid legacy; do
             [ -z "$dt" ] && continue
+            row_idx=$(( row_idx + 1 ))
             local cls="b-ok" label="$status"
             # 失敗優先判定：演練模式若 rsync 出錯，仍必須顯示成錯誤而非 DRYRUN
             case "$status" in
@@ -152,14 +214,46 @@ HTML_HEAD
                     if [ "$dry" = 1 ]; then cls="b-dry"; label="DRYRUN"; else cls="b-ok"; fi
                     ;;
             esac
-            printf '<tr><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%ss</td></tr>\n' \
-                "$dt" "$cls" "$label" "$mc" "$(human "$mb")" "$dc" "$(human "$db")" \
-                "${skipped:-0}" "${kept:-0}" "$rc" "$dur"
+
+            # 只有最近 DETAIL_RUNS 筆會留有明細檔；找不到就渲染成不可展開的一般列
+            local dfile has_det=0
+            dfile="$DETAIL_DIR/$runid.tsv"
+            [ -n "$runid" ] && [ "$row_idx" -le "$DETAIL_RUNS" ] && [ -s "$dfile" ] && has_det=1
+
+            local cells
+            cells="$(printf '<span>%s%s</span><span><span class="badge %s">%s</span></span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%ss</span>' \
+                "$([ "$has_det" = 1 ] && printf '<span class="caret">&#9656;</span> ' || printf '<span class="caret"></span> ')" \
+                "$dt" "$cls" "$(printf '%s' "$label" | html_escape)" \
+                "$mc" "$(human "$mb")" "$dc" "$(human "$db")" "$rc" "$dur")"
+
+            if [ "$has_det" = 0 ]; then
+                printf '<div class="row norow">%s</div>\n' "$cells"
+                continue
+            fi
+
+            printf '<details class="run"><summary><div class="row">%s</div></summary>\n' "$cells"
+            echo '<div class="det"><div class="scroll"><table>'
+            echo '<tr><th>動作</th><th>大小</th><th>路徑</th></tr>'
+            while IFS=$'\t' read -r act sz path; do
+                [ -z "$act" ] && continue
+                local acls="a-mv"
+                case "$act" in
+                    DELETE)    acls="a-dl";;
+                    TRUNCATED) acls="a-tr";;
+                esac
+                printf '<tr><td><span class="act %s">%s</span></td><td class="n">%s</td><td class="p">%s</td></tr>\n' \
+                    "$acls" "$act" \
+                    "$([ "$act" = TRUNCATED ] && printf '—' || human "$sz")" \
+                    "$(printf '%s' "$path" | html_escape)"
+            done < "$dfile"
+            echo '</table></div></div></details>'
         done <<< "$rows"
-        echo '</tbody></table></div></div>'
-        echo '<div class="foot">由 sync_archive.sh 自動產生　·　詳細逐檔紀錄請見同目錄 sync_YYYY-MM-DD.log</div>'
+        echo '</div></div></div>'
+        echo '<div class="foot">由 sync_archive.sh 自動產生　·　<strong>本頁只在每次執行完整收尾後才更新</strong>，搬移進行中不會看到半套數字<br>逐檔明細保留最近 '"$DETAIL_RUNS"' 次執行；更早的紀錄請見同目錄 sync_YYYY-MM-DD.log</div>'
         echo '</body></html>'
-    } > "$SUMMARY_HTML" 2>/dev/null
+    } > "$out_tmp" 2>/dev/null
+    # 原子替換：讀取者只會看到舊版或新版，不會看到寫到一半的檔案
+    mv -f "$out_tmp" "$SUMMARY_HTML" 2>/dev/null || rm -f "$out_tmp" 2>/dev/null
 }
 
 die()  {
@@ -171,29 +265,8 @@ die()  {
     fi
     exit 1
 }
-cleanup() { rm -f "$FILELIST" "$OLDLIST" "$RSYNCLIST" 2>/dev/null; }
+cleanup() { rm -f "$FILELIST" "$DETAIL_TMP" "$RSYNC_OUT" "$SUMMARY_HTML.tmp.$$" 2>/dev/null; }
 trap cleanup EXIT
-
-# 更新豁免清單：把本輪新封存的過舊檔加進去，並剔除已不存在於 $DST 的項目
-# （檔案被人工刪除後就不需要再記，避免清單無限增長）。
-update_keep_ledger() {
-    local tmp p
-    tmp="$(mktemp "${TMPDIR:-/tmp}/sync_keepold.XXXXXX")" || return 0
-    {
-        [ -f "$KEEP_LEDGER" ] && cat "$KEEP_LEDGER"
-        if [ "$OVER_RETENTION_POLICY" = keep ]; then
-            while IFS= read -r -d '' p; do printf '%s\0' "${p#./}"; done < "$OLDLIST"
-        fi
-    } | sort -z -u | while IFS= read -r -d '' p; do
-        [ -e "$DST/$p" ] && printf '%s\0' "$p"
-    done > "$tmp"
-    # 沒有任何豁免項就不要在封存目錄留下空檔案
-    if [ -s "$tmp" ]; then
-        mv -f "$tmp" "$KEEP_LEDGER" 2>/dev/null || rm -f "$tmp"
-    else
-        rm -f "$tmp" "$KEEP_LEDGER" 2>/dev/null
-    fi
-}
 
 # 清理來源目錄：只針對「本輪搬移檔案的上層目錄（含其祖先）」嘗試 rmdir。
 # rmdir 只在目錄確實空了才會成功，所以不會誤刪 IPCAM 仍在使用、或跨日剛建立
@@ -220,7 +293,7 @@ prune_moved_src_dirs() {
             esac
             d="${d%/*}"
         done
-    done < "$RSYNCLIST" | sort -z -u -r | while IFS= read -r -d '' d; do
+    done < "$FILELIST" | sort -z -u -r | while IFS= read -r -d '' d; do
         rmdir "$SRC/$d" 2>/dev/null || true
     done
 }
@@ -244,29 +317,41 @@ fi
 CUTOFF="$(date -d "00:00:00 today - ${ARCHIVE_BEFORE_DAYS_AGO} days" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
 [ -n "$CUTOFF" ] || die "無法計算基準日（date -d 不支援？）"
 
-# 保留期基準也在開跑時「定格」成一個固定時間點，搬移清單與 $DST 保留刪除
-# 共用同一個值。若沿用 -mtime +N（相對「當下」計算），rsync 跑數小時的大批
-# 首搬會讓兩個階段各自看到不同的「當下」——掃描時未過期的檔案，到保留階段
-# 可能剛好跨過期限，於同一輪被「搬過去 → 立刻刪掉」，靜默遺失。
+# 保留期基準在開跑時「定格」成一個固定時間點，讓長時間執行（大批首搬 rsync 可能
+# 跑數小時）過程中的判定基準不會隨「當下」漂移，log 也才對得起來。
 # 換算：-mtime +N 命中「年齡 ≥ (N+1)*24h」的檔，故定格點 = 開跑時刻 - (N+1) 天，
-# 語義與原本完全相同，只是凍結在 START_TS 不再隨執行時間漂移。
+# 語義與 -mtime +RETENTION_DAYS 完全相同，只是凍結在 START_TS。
 RET_CUTOFF="$(date -d "@$(( START_TS - (RETENTION_DAYS + 1) * 86400 ))" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)"
 [ -n "$RET_CUTOFF" ] || die "無法計算保留基準（date -d 不支援？）"
 
 log "START  src=$SRC dst=$DST dry_run=$DRY_RUN 封存基準=<$CUTOFF 之前> retention=${RETENTION_DAYS}d 保留基準=<$RET_CUTOFF 之前刪>"
 
 # --- 前置健康檢查 -------------------------------------------------------------
+# 來源的問題「只」讓封存階段停擺，不影響 NAS 端的保留期清理 ——
+# A PC 關機或 CIFS 掉線期間，$DST 的清理仍須照常運作，否則來源離線多久，
+# NAS 就有多久不清理。因此這裡不呼叫 die，改成記錄後設旗標往下走。
+#
 # REQUIRE_MOUNTPOINT=1：要求 $SRC 必須是掛載點。CIFS 部署建議開啟——分享夾沒掛上時
 #   掛載點只是個空目錄，不擋下來會誤以為「沒東西可搬」而靜默空轉。
 # REQUIRE_MOUNTPOINT=0（預設）：來源是本機資料夾的情境，只要求目錄存在即可。
 if [ "$REQUIRE_MOUNTPOINT" = 1 ]; then
     if command -v mountpoint >/dev/null 2>&1; then
-        mountpoint -q "$SRC" || die "來源不是掛載點或未掛載: $SRC"
+        mountpoint -q "$SRC" 2>/dev/null || \
+            { SRC_UNAVAILABLE=1; SRC_ERR="來源不是掛載點或未掛載: $SRC"; }
     else
-        mount | grep -qF " on $SRC " || die "來源未在 mount 清單中: $SRC"
+        mount | grep -qF " on $SRC " || \
+            { SRC_UNAVAILABLE=1; SRC_ERR="來源未在 mount 清單中: $SRC"; }
     fi
 fi
-[ -d "$SRC" ] || die "來源目錄不存在: $SRC"
+if [ "$SRC_UNAVAILABLE" = 0 ] && [ ! -d "$SRC" ]; then
+    SRC_UNAVAILABLE=1; SRC_ERR="來源目錄不存在: $SRC"
+fi
+if [ "$SRC_UNAVAILABLE" = 1 ]; then
+    log "ERROR  $SRC_ERR"
+    log "INFO   跳過封存階段；$DST 的保留期清理仍照常執行"
+fi
+
+# 目的地問題則兩個階段都做不了，維持中止
 mkdir -p "$DST" 2>/dev/null
 _probe="$DST/.write_test_$$"
 if ! ( : > "$_probe" ) 2>/dev/null; then
@@ -274,130 +359,87 @@ if ! ( : > "$_probe" ) 2>/dev/null; then
 fi
 rm -f "$_probe"
 
-# --- 搬移階段（安全 mv） ------------------------------------------------------
-cd "$SRC" || die "無法進入來源目錄: $SRC"
+# --- 封存階段（安全 mv）：只負責把來源搬到 $DST，不做任何保留期判斷 -----------
+# 職責分工：這一階段的目標單純是「釋放來源空間、NAS 上有一份」。
+# 檔案該不該留，一律由下面的保留階段在 $DST 上決定。
+if [ "$SRC_UNAVAILABLE" = 0 ]; then
+    cd "$SRC" || die "無法進入來源目錄: $SRC"
 
-# 一般待搬清單：mtime 早於基準日（! -newermt = 不比基準新 = 基準日之前），
-# 且尚未超過保留期；排除暫存檔。
-find . -type f ! -newermt "$CUTOFF" -newermt "$RET_CUTOFF" \
-    ! -name '*.tmp' -print0 > "$FILELIST"
+    # 待搬清單：mtime 早於基準日（! -newermt = 不比基準新 = 基準日之前），排除暫存檔
+    find . -type f ! -newermt "$CUTOFF" ! -name '*.tmp' -print0 > "$FILELIST"
 
-# 過舊清單：早於基準日、且已超過保留期的檔。與上面用的是同一個定格的
-# $RET_CUTOFF，兩份清單保證互斥且無縫接合，不會漏檔也不會重複。
-find . -type f ! -newermt "$CUTOFF" ! -newermt "$RET_CUTOFF" \
-    ! -name '*.tmp' -print0 > "$OLDLIST"
+    # 統計待搬位元組（此時來源檔仍在）
+    while IFS= read -r -d '' f; do
+        sz=$(stat -c %s "$SRC/$f" 2>/dev/null || echo 0)
+        MOVE_BYTES=$(( MOVE_BYTES + sz ))
+    done < "$FILELIST"
+    MOVE_COUNT=$(tr -cd '\0' < "$FILELIST" | wc -c)
 
-# 統計待搬位元組（此時來源檔仍在）
-while IFS= read -r -d '' f; do
-    sz=$(stat -c %s "$SRC/$f" 2>/dev/null || echo 0)
-    MOVE_BYTES=$(( MOVE_BYTES + sz ))
-done < "$FILELIST"
-MOVE_COUNT=$(tr -cd '\0' < "$FILELIST" | wc -c)
+    log "SCAN   找到 $MOVE_COUNT 個符合基準的檔，共 $(human "$MOVE_BYTES")"
 
-while IFS= read -r -d '' f; do
-    sz=$(stat -c %s "$SRC/$f" 2>/dev/null || echo 0)
-    OLD_COUNT=$(( OLD_COUNT + 1 )); OLD_BYTES=$(( OLD_BYTES + sz ))
-done < "$OLDLIST"
+    if [ "$MOVE_COUNT" -gt 0 ]; then
+        RSYNC_OPTS=(-a --from0 --files-from="$FILELIST" --out-format='MOVE %l %n')
+        if [ "$DRY_RUN" = 1 ]; then
+            RSYNC_OPTS+=(--dry-run)
+            log "DRYRUN 以下為將搬移清單（未實際搬移/刪除）"
+        else
+            RSYNC_OPTS+=(--remove-source-files)
+        fi
 
-log "SCAN   找到 $MOVE_COUNT 個符合基準的檔，共 $(human "$MOVE_BYTES")"
+        # 先接到暫存檔：log 要完整原樣保留，明細則另外抽出 MOVE 行轉成 TSV
+        rsync "${RSYNC_OPTS[@]}" "$SRC/" "$DST/" > "$RSYNC_OUT" 2>&1
+        RC=$?
+        cat "$RSYNC_OUT" >> "$LOG" 2>/dev/null
+        # 只取檔案（略過結尾為 / 的目錄項）；用 index 定位避免路徑含空白時被切斷
+        awk -F'\n' '
+            /^MOVE /{
+                split($0, a, " ")
+                sz = a[2]
+                rest = substr($0, index($0, sz) + length(sz) + 1)
+                if (rest !~ /\/$/) printf "MOVE\t%s\t%s\n", sz, rest
+            }' "$RSYNC_OUT" >> "$DETAIL_TMP" 2>/dev/null
 
-# 依政策決定過舊檔的去向，並組出真正要交給 rsync 的清單
-cp "$FILELIST" "$RSYNCLIST" 2>/dev/null
-if [ "$OLD_COUNT" -gt 0 ]; then
-    case "$OVER_RETENTION_POLICY" in
-        keep)
-            # 搬到 $DST 並登記豁免，往後的保留期刪除不會碰它們
-            cat "$OLDLIST" >> "$RSYNCLIST"
-            KEEP_COUNT="$OLD_COUNT"; KEEP_BYTES="$OLD_BYTES"
-            MOVE_COUNT=$(( MOVE_COUNT + OLD_COUNT )); MOVE_BYTES=$(( MOVE_BYTES + OLD_BYTES ))
-            while IFS= read -r -d '' f; do
-                log "KEEPOLD $(stat -c %s "$SRC/$f" 2>/dev/null || echo 0) $f"
-            done < "$OLDLIST"
-            log "INFO   上列 $KEEP_COUNT 個檔（$(human "$KEEP_BYTES")）mtime 已超過保留期 ${RETENTION_DAYS} 天，"
-            log "INFO   仍搬移封存並登記於 ${KEEP_LEDGER##*/}，永久豁免保留期刪除（NAS 容量請自行留意）"
-            ;;
-        archive)
-            # 當成一般檔搬移，之後由保留期正常刪除
-            cat "$OLDLIST" >> "$RSYNCLIST"
-            MOVE_COUNT=$(( MOVE_COUNT + OLD_COUNT )); MOVE_BYTES=$(( MOVE_BYTES + OLD_BYTES ))
-            log "INFO   含 $OLD_COUNT 個已超過保留期的檔（$(human "$OLD_BYTES")），搬移後將由保留期刪除"
-            ;;
-        skip)
-            # 不搬也不刪，原地留在來源等人工判斷
-            SKIP_COUNT="$OLD_COUNT"; SKIP_BYTES="$OLD_BYTES"
-            while IFS= read -r -d '' f; do
-                log "SKIPOLD $(stat -c %s "$SRC/$f" 2>/dev/null || echo 0) $f"
-            done < "$OLDLIST"
-            log "WARN   另有 $SKIP_COUNT 個檔（$(human "$SKIP_BYTES")）mtime 已超過保留期 ${RETENTION_DAYS} 天，"
-            log "WARN   未搬移亦未刪除，原地保留於來源（搬過去也會立刻被保留期刪掉），請人工處理"
-            ;;
-    esac
-fi
+        if [ "$RC" -ne 0 ]; then
+            log "WARN   rsync 退出碼=$RC（已成功傳輸的檔仍安全落地；未完成者保留於來源）"
+        fi
 
-if [ "$MOVE_COUNT" -gt 0 ]; then
-    RSYNC_OPTS=(-a --from0 --files-from="$RSYNCLIST" --out-format='MOVE %l %n')
-    if [ "$DRY_RUN" = 1 ]; then
-        RSYNC_OPTS+=(--dry-run)
-        log "DRYRUN 以下為將搬移清單（未實際搬移/刪除）"
-    else
-        RSYNC_OPTS+=(--remove-source-files)
-    fi
-
-    rsync "${RSYNC_OPTS[@]}" "$SRC/" "$DST/" >> "$LOG" 2>&1
-    RC=$?
-    if [ "$RC" -ne 0 ]; then
-        log "WARN   rsync 退出碼=$RC（已成功傳輸的檔仍安全落地；未完成者保留於來源）"
-    fi
-
-    if [ "$DRY_RUN" != 1 ]; then
-        prune_moved_src_dirs
+        if [ "$DRY_RUN" != 1 ]; then
+            prune_moved_src_dirs
+        fi
     fi
 fi
 
-# 更新豁免清單（演練不寫入）。即使本輪沒有新的過舊檔也要跑，才能剔除
-# 已被人工刪除的項目，避免清單無限增長。
-if [ "$DRY_RUN" != 1 ]; then
-    update_keep_ledger
+# --- 保留階段：只對 $DST，依檔案原始 mtime 判定，超過保留期就刪 ----------------
+# 這一階段完全不依賴來源 —— 即使 A PC 離線、封存階段被跳過，NAS 上的清理照常執行。
+# 保留 1 年（RETENTION_DAYS=365）→ 年齡達 366 天的檔即刪除。
+if [ "$DRY_RUN" = 1 ]; then
+    log "DRYRUN 以下為將刪除（>${RETENTION_DAYS}天）清單（未實際刪除）"
+    while IFS=$'\t' read -r sz rel; do
+        log "DELETE $sz $DST/$rel"
+        detail DELETE "$sz" "$rel"
+        DEL_COUNT=$(( DEL_COUNT + 1 )); DEL_BYTES=$(( DEL_BYTES + sz ))
+    done < <(find "$DST" -type f ! -newermt "$RET_CUTOFF" -printf '%s\t%P\n' 2>/dev/null)
+else
+    while IFS=$'\t' read -r sz rel; do
+        log "DELETE $sz $DST/$rel"
+        detail DELETE "$sz" "$rel"
+        DEL_COUNT=$(( DEL_COUNT + 1 )); DEL_BYTES=$(( DEL_BYTES + sz ))
+    done < <(find "$DST" -type f ! -newermt "$RET_CUTOFF" -printf '%s\t%P\n' -delete 2>/dev/null)
+    find "$DST" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 fi
-
-# --- 保留階段（只對 $DST，依原始 mtime；用定格的 $RET_CUTOFF，與搬移清單同基準）
-# 載入豁免清單：登記在案的檔案永久保留，不受保留期刪除。
-declare -A KEEPSET=()
-if [ -f "$KEEP_LEDGER" ]; then
-    while IFS= read -r -d '' _p; do KEEPSET["$_p"]=1; done < "$KEEP_LEDGER"
-fi
-
-[ "$DRY_RUN" = 1 ] && log "DRYRUN 以下為將刪除（>${RETENTION_DAYS}天）清單（未實際刪除）"
-
-# 逐筆判定後才刪，才有機會跳過豁免項；清單檔本身也排除在候選之外。
-EXEMPT_COUNT=0
-while IFS= read -r -d '' _rec; do
-    sz="${_rec%%	*}"; rel="${_rec#*	}"
-    if [ -n "${KEEPSET[$rel]:-}" ]; then
-        EXEMPT_COUNT=$(( EXEMPT_COUNT + 1 ))
-        continue
-    fi
-    log "DELETE $sz $DST/$rel"
-    DEL_COUNT=$(( DEL_COUNT + 1 )); DEL_BYTES=$(( DEL_BYTES + sz ))
-    [ "$DRY_RUN" = 1 ] || rm -f "$DST/$rel" 2>/dev/null
-done < <(find "$DST" -type f ! -newermt "$RET_CUTOFF" \
-             ! -path "$KEEP_LEDGER" -printf '%s\t%P\0' 2>/dev/null)
-
-if [ "$EXEMPT_COUNT" -gt 0 ]; then
-    log "INFO   $EXEMPT_COUNT 個已超過保留期的檔登記於豁免清單，予以保留未刪除"
-fi
-[ "$DRY_RUN" = 1 ] || find "$DST" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
 # --- log 自我歸檔清理 ---------------------------------------------------------
 find "$LOG_DIR" -maxdepth 1 -name 'sync_*.log' -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 
 # --- 收尾 summary（txt log + summary_time.html） -----------------------------
 DUR=$(( $(date +%s) - START_TS ))
-log "SUMMARY moved=$MOVE_COUNT movedBytes=$MOVE_BYTES deleted=$DEL_COUNT deletedBytes=$DEL_BYTES skippedOld=$SKIP_COUNT skippedBytes=$SKIP_BYTES keptOld=$KEEP_COUNT keptBytes=$KEEP_BYTES rsync_rc=$RC dur=${DUR}s dry_run=$DRY_RUN"
+log "SUMMARY moved=$MOVE_COUNT movedBytes=$MOVE_BYTES deleted=$DEL_COUNT deletedBytes=$DEL_BYTES rsync_rc=$RC dur=${DUR}s dry_run=$DRY_RUN srcUnavailable=$SRC_UNAVAILABLE"
 
-# rsync 失敗優先於 DRY_RUN 判定：演練的目的就是在上線前抓出環境問題
+# 失敗優先於 DRY_RUN 判定：演練的目的就是在上線前抓出環境問題
 # （例如缺 rsync 會得到 rc=127），若一律記成 DRYRUN 並 exit 0 就驗不出來。
-if [ "$RC" -ne 0 ]; then
+if [ "$SRC_UNAVAILABLE" = 1 ]; then
+    append_summary "ERROR: $SRC_ERR"
+elif [ "$RC" -ne 0 ]; then
     append_summary "ERROR: rsync rc=$RC"
 elif [ "$DRY_RUN" = 1 ]; then
     append_summary "DRYRUN"
@@ -405,11 +447,15 @@ else
     append_summary "OK"
 fi
 
-if [ "$RC" -ne 0 ]; then
+# 來源不可用時保留階段已經跑完，但仍須以非零結束並通知，否則問題會被無聲吃掉
+if [ "$SRC_UNAVAILABLE" = 1 ] || [ "$RC" -ne 0 ]; then
+    _status_msg="rsync rc=$RC"
+    [ "$SRC_UNAVAILABLE" = 1 ] && _status_msg="$SRC_ERR"
     if [ "$NOTIFY_ON_ERROR" = 1 ] && [ "$DRY_RUN" != 1 ] && [ -x /usr/syno/bin/synonotify ]; then
         /usr/syno/bin/synonotify "SYNOScheduledTaskComplete" \
-            "{\"%TASKNAME%\":\"sync_archive\",\"%STATUS%\":\"rsync rc=$RC\"}" 2>/dev/null || true
+            "{\"%TASKNAME%\":\"sync_archive\",\"%STATUS%\":\"$_status_msg\"}" 2>/dev/null || true
     fi
+    [ "$SRC_UNAVAILABLE" = 1 ] && exit 1
     exit "$RC"
 fi
 

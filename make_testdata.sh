@@ -10,9 +10,10 @@
 #   3. 亂數 — 亂數種子、每日檔案數範圍、檔案大小範圍
 #
 # 產生的日期刻意跨越「今天 00:00」這條分界：
-#   - 今天之前的資料夾        → 腳本應「搬移封存」
+#   - 今天之前的資料夾        → 腳本應「搬移封存」並留在 NAS
 #   - 今天的資料夾            → 腳本應「完全不動」
-#   - 超過保留期(>RETENTION)  → 腳本應「記 SKIPOLD，留在來源不搬也不刪」
+#   - 超過保留期(>RETENTION)  → 腳本應「照樣搬移，再由保留階段從 NAS 刪除」
+#                               （log 會同時有 MOVE 與 DELETE 兩筆）
 #
 # 用法：
 #   bash make_testdata.sh                 # 互動問答
@@ -34,7 +35,9 @@ POS_ROOT=""
 for arg in "$@"; do
     case "$arg" in
         -y|--yes) ASSUME_YES=1 ;;
-        -h|--help) sed -n '2,25p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        # 印出開頭的說明區塊（讀到第二條 ==== 分隔線為止，不寫死行號免得改註解就截斷）
+        -h|--help) awk 'NR==1{next} /^# ={10,}/{if(s)exit; s=1; next} {print}' \
+                       "${BASH_SOURCE[0]}"; exit 0 ;;
         -*) echo "未知選項: $arg" >&2; exit 2 ;;
         *)  POS_ROOT="$arg" ;;
     esac
@@ -45,7 +48,29 @@ INTERACTIVE=1
 { [ "$ASSUME_YES" = 1 ] || [ ! -t 0 ]; } && INTERACTIVE=0
 
 # --- 預設值（可由環境變數覆寫）------------------------------------------------
-: "${ROOT:=${POS_ROOT:-$SCRIPT_DIR/testfile}}"
+# 輸出目錄預設直接採用 sync_archive.conf 的 SRC —— 否則預設值與封存腳本實際讀取的
+# 來源不一致，位置那題按 Enter 就會把資料產到別的地方，然後 sync 掃不到任何檔案。
+CONF_FILE="$SCRIPT_DIR/sync_archive.conf"
+DEFAULT_ROOT="$SCRIPT_DIR/testfile"
+ROOT_FROM_CONF=0
+if [ -f "$CONF_FILE" ]; then
+    _conf_src=""
+    while IFS= read -r _line; do
+        case "$_line" in
+            SRC=*)
+                _conf_src="${_line#SRC=}"
+                _conf_src="${_conf_src%\"}"; _conf_src="${_conf_src#\"}"
+                _conf_src="${_conf_src%\'}"; _conf_src="${_conf_src#\'}"
+                ;;
+        esac
+    done < "$CONF_FILE"
+    if [ -n "$_conf_src" ]; then
+        DEFAULT_ROOT="$_conf_src"
+        ROOT_FROM_CONF=1
+    fi
+fi
+
+: "${ROOT:=${POS_ROOT:-$DEFAULT_ROOT}}"
 : "${DATE_FROM:=$(date -d "$TODAY - 30 days" +%F)}"
 : "${DATE_TO:=$TODAY}"
 : "${INCLUDE_TODAY:=y}"
@@ -109,6 +134,8 @@ ask_date() {  # $1=提示  $2=預設 → stdout YYYY-MM-DD
 
 # --- 1. 位置 ------------------------------------------------------------------
 echo "===== 1/3 位置 ====="
+[ "$ROOT_FROM_CONF" = 1 ] && [ "$ROOT" = "$DEFAULT_ROOT" ] && \
+    echo "  （預設值取自 sync_archive.conf 的 SRC，封存腳本就是讀這個目錄）"
 ROOT="$(ask "測試資料要產生在哪個目錄" "$ROOT")"
 # 尾斜線剝到底（"///" 只剝一層會變 "//" 而繞過下面的根目錄檢查）
 while [ "$ROOT" != "/" ] && [ "${ROOT%/}" != "$ROOT" ]; do ROOT="${ROOT%/}"; done
@@ -161,7 +188,7 @@ else
     INCLUDE_TODAY=n
 fi
 
-if ask_yn "額外加入超過保留期的過舊檔（驗證 SKIPOLD 不搬也不刪）" "$MAKE_OLD"; then
+if ask_yn "額外加入超過保留期的過舊檔（驗證搬移後由保留階段刪除）" "$MAKE_OLD"; then
     MAKE_OLD=y
     OLD_DAYS="$(ask_int "過舊檔要距今幾天（需 > RETENTION_DAYS，預設 365）" "$OLD_DAYS" 366 36500)"
 else
@@ -224,7 +251,7 @@ done
 [ "$INCLUDE_TODAY" = y ] && dates="$dates $TODAY"
 dates="$(echo "$dates" | tr ' ' '\n' | grep -v '^$' | sort -u)"
 
-n_move=0; n_keep=0; n_skip=0
+n_move=0; n_keep=0; n_expired=0
 
 # ---- Enter_Leave/ （PDF；過舊檔也放這裡） -----------------------------------
 first_date="$(echo "$dates" | head -1)"
@@ -241,7 +268,7 @@ if [ "$MAKE_OLD" = y ]; then
         rnd "$SIZE_MIN_KB" "$SIZE_MAX_KB"; kb=$RND
         rand_time
         mkfile "$ROOT/Enter_Leave/old_record_$i.pdf" "$kb" "$old_date $RT"
-        n_skip=$((n_skip+1))
+        n_expired=$((n_expired+1))
     done
 fi
 
@@ -298,10 +325,17 @@ echo "  檔案總數 : $total（共 $human）"
 echo "  亂數種子 : $SEED   ← 用 SEED=$SEED 可重現同樣的結構"
 echo
 echo "===== 對 sync_archive.sh 的預期行為 ====="
-printf '  應被搬移封存 : %s 檔（mtime 早於今天 00:00）\n' "$n_move"
+if [ "$MAKE_OLD" = y ]; then
+    printf '  應被搬移封存 : %s 檔（mtime 早於今天 00:00，含下面那 %s 個過舊檔）\n' \
+           "$(( n_move + n_expired ))" "$n_expired"
+else
+    printf '  應被搬移封存 : %s 檔（mtime 早於今天 00:00）\n' "$n_move"
+fi
 printf '  應留在來源   : %s 檔（今天 %s 的檔，腳本不碰）\n' "$n_keep" "$TODAY"
 if [ "$MAKE_OLD" = y ]; then
-    printf '  應記 SKIPOLD : %s 檔（%s，超過保留期，不搬也不刪）\n' "$n_skip" "$old_date"
+    printf '  搬完隨即刪除 : %s 檔（%s，已超過保留期，搬到 NAS 後由保留階段刪掉）\n' \
+           "$n_expired" "$old_date"
+    printf '                 → 最終 dst 只會留下 %s 檔\n' "$n_move"
 fi
 echo
 echo "  提示：conf 設 REQUIRE_MOUNTPOINT=0（預設）時可直接對本機資料夾執行；"
