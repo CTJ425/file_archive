@@ -14,6 +14,12 @@
 #   - 今天的資料夾            → 腳本應「完全不動」
 #   - 超過保留期(>RETENTION)  → 腳本應「照樣搬移，再由保留階段從 NAS 刪除」
 #                               （log 會同時有 MOVE 與 DELETE 兩筆）
+#   - 保留期邊界前後各一       → 年齡 RETENTION 天應留、RETENTION+1 天應刪，
+#                               差一天就翻面，用來抓保留判定的 off-by-one
+#   - *.tmp（mtime 已過基準日）→ 腳本應「排除不搬」，驗證寫入中的檔不會被動到
+#
+# 保留天數以 sync_archive.conf 的 RETENTION_DAYS 為準（讀不到才用 365），
+# 過舊檔與邊界檔的天數都由它計算 —— 寫死天數的話，conf 一改對帳就會失準。
 #
 # 用法：
 #   bash make_testdata.sh                 # 互動問答
@@ -21,7 +27,7 @@
 #   bash make_testdata.sh -y [/path]      # 全部用預設值，不問（給 CI/腳本用）
 #
 # 非互動時可用環境變數覆寫預設：
-#   ROOT DATE_FROM DATE_TO INCLUDE_TODAY MAKE_OLD OLD_DAYS
+#   ROOT DATE_FROM DATE_TO INCLUDE_TODAY MAKE_OLD OLD_DAYS RETENTION_DAYS MAKE_TMP
 #   SEED FILES_MIN FILES_MAX SIZE_MIN_KB SIZE_MAX_KB SITE_PREFIX CAM_ID FORCE
 # ============================================================================
 set -eu
@@ -53,6 +59,10 @@ INTERACTIVE=1
 CONF_FILE="$SCRIPT_DIR/sync_archive.conf"
 DEFAULT_ROOT="$SCRIPT_DIR/testfile"
 ROOT_FROM_CONF=0
+# 保留天數也一併讀進來：過舊檔／保留期邊界檔的天數必須依「實際生效的保留期」計算，
+# 寫死 365 的話，只要 conf 把 RETENTION_DAYS 調長，報告裡「搬完隨即刪除」就會是錯的。
+_conf_ret=""
+RETENTION_FROM_CONF=0
 if [ -f "$CONF_FILE" ]; then
     _conf_src=""
     while IFS= read -r _line; do
@@ -62,12 +72,20 @@ if [ -f "$CONF_FILE" ]; then
                 _conf_src="${_conf_src%\"}"; _conf_src="${_conf_src#\"}"
                 _conf_src="${_conf_src%\'}"; _conf_src="${_conf_src#\'}"
                 ;;
+            RETENTION_DAYS=*)
+                _conf_ret="${_line#RETENTION_DAYS=}"
+                _conf_ret="${_conf_ret%\"}"; _conf_ret="${_conf_ret#\"}"
+                _conf_ret="${_conf_ret%\'}"; _conf_ret="${_conf_ret#\'}"
+                # 只接受純數字，避免註解或空白混進來後拿去做算術
+                [ -z "${_conf_ret//[0-9]/}" ] || _conf_ret=""
+                ;;
         esac
     done < "$CONF_FILE"
     if [ -n "$_conf_src" ]; then
         DEFAULT_ROOT="$_conf_src"
         ROOT_FROM_CONF=1
     fi
+    [ -n "$_conf_ret" ] && RETENTION_FROM_CONF=1
 fi
 
 : "${ROOT:=${POS_ROOT:-$DEFAULT_ROOT}}"
@@ -75,7 +93,10 @@ fi
 : "${DATE_TO:=$TODAY}"
 : "${INCLUDE_TODAY:=y}"
 : "${MAKE_OLD:=y}"
-: "${OLD_DAYS:=400}"
+# 保留期：以 conf 為準（可用環境變數覆寫），過舊檔預設抓「保留期 + 35 天」
+: "${RETENTION_DAYS:=${_conf_ret:-365}}"
+: "${OLD_DAYS:=$(( RETENTION_DAYS + 35 ))}"
+: "${MAKE_TMP:=y}"
 : "${SEED:=$RANDOM}"
 : "${FILES_MIN:=3}"
 : "${FILES_MAX:=8}"
@@ -188,11 +209,33 @@ else
     INCLUDE_TODAY=n
 fi
 
-if ask_yn "額外加入超過保留期的過舊檔（驗證搬移後由保留階段刪除）" "$MAKE_OLD"; then
+# 標明這個天數哪來的：環境變數蓋掉 conf 時要講清楚，否則對帳對不上會找不到原因
+if [ "$RETENTION_FROM_CONF" = 1 ] && [ "$RETENTION_DAYS" = "$_conf_ret" ]; then
+    _ret_src="取自 sync_archive.conf"
+elif [ "$RETENTION_FROM_CONF" = 1 ]; then
+    _ret_src="由環境變數指定，conf 實際是 $_conf_ret —— 兩者不一致時請以 conf 為準"
+else
+    _ret_src="conf 未定義 RETENTION_DAYS，使用預設值"
+fi
+echo "  （保留期 = $RETENTION_DAYS 天，$_ret_src）"
+if ask_yn "額外加入保留期驗證檔（過舊檔 ＋ 保留期邊界前後各一）" "$MAKE_OLD"; then
     MAKE_OLD=y
-    OLD_DAYS="$(ask_int "過舊檔要距今幾天（需 > RETENTION_DAYS，預設 365）" "$OLD_DAYS" 366 36500)"
+    OLD_DAYS="$(ask_int "過舊檔要距今幾天（需 > 保留期 $RETENTION_DAYS）" \
+                        "$OLD_DAYS" "$(( RETENTION_DAYS + 1 ))" 36500)"
+    # 非互動模式下 ask_int 對非法值只會原樣退回，這裡再夾一次，
+    # 否則環境變數給了太小的 OLD_DAYS，報告會宣告「搬完隨即刪除」但檔案其實會留著
+    if [ "$OLD_DAYS" -le "$RETENTION_DAYS" ]; then
+        echo "  ！過舊檔天數 $OLD_DAYS 未超過保留期 $RETENTION_DAYS，自動改為 $(( RETENTION_DAYS + 35 ))" >&2
+        OLD_DAYS=$(( RETENTION_DAYS + 35 ))
+    fi
 else
     MAKE_OLD=n
+fi
+
+if ask_yn "額外加入 *.tmp 檔（驗證「寫入中的檔不搬」的排除規則）" "$MAKE_TMP"; then
+    MAKE_TMP=y
+else
+    MAKE_TMP=n
 fi
 
 # --- 3. 亂數 ------------------------------------------------------------------
@@ -251,7 +294,7 @@ done
 [ "$INCLUDE_TODAY" = y ] && dates="$dates $TODAY"
 dates="$(echo "$dates" | tr ' ' '\n' | grep -v '^$' | sort -u)"
 
-n_move=0; n_keep=0; n_expired=0
+n_move=0; n_keep=0; n_expired=0; n_tmp=0; MADE_EDGE=0
 
 # ---- Enter_Leave/ （PDF；過舊檔也放這裡） -----------------------------------
 first_date="$(echo "$dates" | head -1)"
@@ -270,6 +313,27 @@ if [ "$MAKE_OLD" = y ]; then
         mkfile "$ROOT/Enter_Leave/old_record_$i.pdf" "$kb" "$old_date $RT"
         n_expired=$((n_expired+1))
     done
+fi
+
+# ---- 保留期邊界：刻意各放一個「剛好差一天」的檔 -----------------------------
+# 保留判定是「開跑時刻 −(RETENTION_DAYS+1) 天」之前的檔才刪，所以：
+#   年齡 = RETENTION_DAYS   天 → 應保留在 DST
+#   年齡 = RETENTION_DAYS+1 天 → 應被刪除
+# 這兩個檔差一天就翻面，是驗 off-by-one 最直接的方式（過舊檔差 35 天驗不出來）。
+# 時間用 epoch 精算而非隨機時分秒 —— 邊界檔抽到不同的時分秒就會翻面。
+# delete 檔多往前抓 1 小時當緩衝：判定基準是 sync「開跑當下」，產生後越晚跑基準越晚，
+# 緩衝讓「產生後 1 小時內執行」都還站在正確的一側。
+if [ "$MAKE_OLD" = y ] && [ "$RETENTION_DAYS" -ge 1 ]; then
+    _now=$(date +%s)
+    _edge_keep=$(( _now - RETENTION_DAYS * 86400 ))
+    _edge_del=$(( _now - (RETENTION_DAYS + 1) * 86400 - 3600 ))
+    rnd "$SIZE_MIN_KB" "$SIZE_MAX_KB"; kb=$RND
+    mkfile "$ROOT/Enter_Leave/retention_edge_keep_${RETENTION_DAYS}d.pdf" "$kb" "@$_edge_keep"
+    n_move=$((n_move+1))
+    rnd "$SIZE_MIN_KB" "$SIZE_MAX_KB"; kb=$RND
+    mkfile "$ROOT/Enter_Leave/retention_edge_delete_$(( RETENTION_DAYS + 1 ))d.pdf" "$kb" "@$_edge_del"
+    n_expired=$((n_expired+1))
+    MADE_EDGE=1
 fi
 
 # ---- Enter_Leave_Records/<date>/  (ALPR 辨識截圖 .jpg) ----------------------
@@ -296,6 +360,22 @@ for d in $dates; do
         done
     done
 done
+
+# ---- *.tmp：模擬 IPCAM 正在寫入中的檔 ---------------------------------------
+# mtime 刻意給「早於基準日」的舊日期 —— 若給今天，它本來就不會被搬，
+# 那就測不出 sync 的 ! -name '*.tmp' 排除規則到底有沒有生效。
+# 放進本來就有檔案的日期資料夾，順便驗證「目錄裡還有東西時不會被 rmdir 收掉」。
+if [ "$MAKE_TMP" = y ]; then
+    tmp_date="$(echo "$dates" | grep -v "^$TODAY$" | head -1 || true)"
+    [ -n "$tmp_date" ] || tmp_date="$(date -d '1 day ago' +%F)"
+    for _pair in "Enter_Leave_Records:jpg" "Enter_Leave_Records_video:avi"; do
+        sub="${_pair%%:*}"; ext="${_pair##*:}"
+        rnd "$SIZE_MIN_KB" "$SIZE_MAX_KB"; kb=$RND
+        rand_time
+        mkfile "$ROOT/$sub/$tmp_date/${CAM}_${tmp_date}_recording.$ext.tmp" "$kb" "$tmp_date $RT"
+        n_tmp=$((n_tmp+1))
+    done
+fi
 
 # --- 目錄時間戳記對齊 ---------------------------------------------------------
 # 寫入檔案會把父目錄的 mtime 改成「當下」，導致日期資料夾掛著今天的時間、
@@ -332,10 +412,29 @@ else
     printf '  應被搬移封存 : %s 檔（mtime 早於今天 00:00）\n' "$n_move"
 fi
 printf '  應留在來源   : %s 檔（今天 %s 的檔，腳本不碰）\n' "$n_keep" "$TODAY"
+if [ "$MAKE_TMP" = y ]; then
+    printf '  排除不搬     : %s 個 *.tmp（mtime 已早於基準日，仍應被排除而留在來源）\n' "$n_tmp"
+    printf '                 → %s/ 這兩個日期夾因此不會變空，也不該被 rmdir 收掉\n' "$tmp_date"
+fi
 if [ "$MAKE_OLD" = y ]; then
-    printf '  搬完隨即刪除 : %s 檔（%s，已超過保留期，搬到 NAS 後由保留階段刪掉）\n' \
-           "$n_expired" "$old_date"
+    printf '  搬完隨即刪除 : %s 檔（保留期 %s 天，搬到 NAS 後由保留階段刪掉）\n' \
+           "$n_expired" "$RETENTION_DAYS"
+    printf '                 · 過舊檔 3 個（%s，距今 %s 天）\n' "$old_date" "$OLD_DAYS"
+    if [ "$MADE_EDGE" = 1 ]; then
+        printf '                 · 邊界檔 1 個 retention_edge_delete_%sd.pdf（年齡 %s 天，剛好過線）\n' \
+               "$(( RETENTION_DAYS + 1 ))" "$(( RETENTION_DAYS + 1 ))"
+    fi
     printf '                 → 最終 dst 只會留下 %s 檔\n' "$n_move"
+fi
+if [ "$MADE_EDGE" = 1 ]; then
+    echo
+    printf '  ★ 保留期邊界檢查（差一天就翻面，用來抓 off-by-one）：\n'
+    printf '      retention_edge_keep_%sd.pdf   年齡 %s 天 → 應留在 dst\n' \
+           "$RETENTION_DAYS" "$RETENTION_DAYS"
+    printf '      retention_edge_delete_%sd.pdf 年齡 %s 天 → 應被刪除\n' \
+           "$(( RETENTION_DAYS + 1 ))" "$(( RETENTION_DAYS + 1 ))"
+    printf '      注意：判定基準是 sync「開跑當下」，邊界檔只留 1 小時緩衝，\n'
+    printf '            請在產生後 1 小時內執行 sync_archive.sh，否則邊界檔的預期結果會反轉。\n'
 fi
 echo
 echo "  提示：conf 設 REQUIRE_MOUNTPOINT=0（預設）時可直接對本機資料夾執行；"

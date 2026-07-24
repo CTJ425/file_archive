@@ -70,6 +70,13 @@ SUMMARY_HTML="$LOG_DIR/summary_time.html"
 LOCKFILE="$LOG_DIR/.sync_archive.lock"
 FILELIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive.XXXXXX")"
 
+# 執行中標記：開跑時寫入、收尾時刪除，summary_time.html 看到它就在最上面多畫一列
+# 「PROG（執行中）」。內容一行 TSV：RUN_ID<TAB>開始epoch<TAB>PID<TAB>DRY_RUN。
+# MARKED_RUNNING 保證「只刪自己寫的那份」—— cleanup 的 EXIT trap 在搶鎖之前就掛上了，
+# 沒有這個旗標，搶不到鎖而提早結束的實例會把「正在跑的另一個實例」的標記刪掉。
+RUNNING_MARKER="$LOG_DIR/.running"
+MARKED_RUNNING=0
+
 # 逐檔明細：每次執行累積到暫存檔，成功收尾時才落地成 details/<執行時間>.tsv，
 # 供 summary_time.html 產生可展開的細項。格式：動作<TAB>位元組<TAB>路徑
 DETAIL_DIR="$LOG_DIR/details"
@@ -129,6 +136,8 @@ append_summary() {
             | while IFS= read -r _old; do rm -f "$_old" 2>/dev/null; done
     fi
 
+    # 先清掉執行中標記再重繪：否則同一頁會同時出現 PROG 列與這次的正式列
+    finish_running_marker
     render_summary_html
 }
 
@@ -141,8 +150,11 @@ html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 # mv 是同檔案系統上的原子操作，使用者永遠不會看到寫到一半的頁面，也不會在
 # 搬移還在跑的時候看到半套數字而誤判。
 render_summary_html() {
-    [ -f "$SUMMARY_TSV" ] || return 0
-    local rows; rows="$(tail -n 200 "$SUMMARY_TSV" | tac)"
+    # 首次執行時還沒有 TSV，但只要有執行中標記就該先把頁面（含 PROG 列）畫出來；
+    # 頁面已存在時也一律重畫，否則首次執行被中斷後，頁面會停在撤不掉的 PROG 列。
+    [ -f "$SUMMARY_TSV" ] || [ -f "$RUNNING_MARKER" ] || [ -f "$SUMMARY_HTML" ] || return 0
+    local rows=""
+    [ -f "$SUMMARY_TSV" ] && rows="$(tail -n 200 "$SUMMARY_TSV" | tac)"
     local out_tmp="$SUMMARY_HTML.tmp.$$"
     local row_idx=0
     {
@@ -152,8 +164,8 @@ render_summary_html() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Synology Sync — 執行摘要</title>
 <style>
-:root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--fg:#1f2328;--mut:#57606a;--bd:#d0d7de;--ok:#1a7f37;--err:#cf222e;--dry:#9a6700;--hd:#eaeef2}
-@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#9198a1;--bd:#30363d;--ok:#3fb950;--err:#f85149;--dry:#d29922;--hd:#21262d}}
+:root{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--fg:#1f2328;--mut:#57606a;--bd:#d0d7de;--ok:#1a7f37;--err:#cf222e;--dry:#9a6700;--run:#0969da;--hd:#eaeef2}
+@media (prefers-color-scheme:dark){:root{--bg:#0d1117;--card:#161b22;--fg:#e6edf3;--mut:#9198a1;--bd:#30363d;--ok:#3fb950;--err:#f85149;--dry:#d29922;--run:#4493f8;--hd:#21262d}}
 *{box-sizing:border-box}body{margin:0;padding:24px;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif}
 h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);font-size:13px;margin-bottom:20px}
 .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow:hidden;max-width:1040px;margin:0 auto}
@@ -192,6 +204,12 @@ details.run[open] .caret{transform:rotate(90deg)}
 .b-ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 15%,transparent)}
 .b-err{color:var(--err);background:color-mix(in srgb,var(--err) 15%,transparent)}
 .b-dry{color:var(--dry);background:color-mix(in srgb,var(--dry) 15%,transparent)}
+/* 執行中：呼吸動畫表示這一列還活著（尊重使用者的減少動態偏好） */
+.b-run{color:var(--run);background:color-mix(in srgb,var(--run) 15%,transparent);
+       animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{50%{opacity:.55}}
+@media (prefers-reduced-motion:reduce){.b-run{animation:none}}
+.dash{color:var(--mut)}
 .foot{color:var(--mut);font-size:12px;text-align:center;margin:16px auto 0;max-width:1040px}
 </style></head><body>
 <h1>Synology Sync — 執行摘要</h1>
@@ -199,6 +217,21 @@ HTML_HEAD
         echo "<div class=\"sub\">最後更新：$(date '+%F %T')　·　來源 <code>$(printf '%s' "$SRC" | html_escape)</code> → 封存 <code>$(printf '%s' "$DST" | html_escape)</code>　·　顯示最近 200 筆，點列可展開逐檔明細</div>"
         echo '<div class="card"><div class="wrap"><div class="grid">'
         echo '<div class="row hdr"><span>執行時間</span><span>狀態</span><span class="num">搬移檔數</span><span class="num">搬移量</span><span class="num">刪除檔數</span><span class="num">釋放量</span><span class="num">rsync</span><span class="num">耗時</span></div>'
+
+        # 執行中列：數字一律留白（—），避免看到跑到一半的半套數字；只有耗時由頁面上的
+        # JS 依開始時間即時遞增。用 norow 讓它外觀一致但不可展開，row_idx 不遞增
+        # （row_idx 是明細檔的名額計數，這一列本來就沒有明細）。
+        if [ -f "$RUNNING_MARKER" ]; then
+            local r_id r_start r_pid r_dry r_when
+            # r_id/r_pid/r_dry 只是把欄位讀完，這裡用不到（少讀會讓後面的欄位被併進來）
+            # shellcheck disable=SC2034
+            IFS=$'\t' read -r r_id r_start r_pid r_dry < "$RUNNING_MARKER"
+            if [ -n "${r_start:-}" ]; then
+                r_when="$(date -d "@$r_start" '+%F %T' 2>/dev/null)"
+                printf '<div class="row norow"><span><span class="caret"></span> %s</span><span><span class="badge b-run">PROG</span></span><span class="num dash">—</span><span class="num dash">—</span><span class="num dash">—</span><span class="num dash">—</span><span class="num dash">—</span><span class="num"><span class="ela" data-start="%s">—</span></span></div>\n' \
+                    "${r_when:-執行中}" "$r_start"
+            fi
+        fi
         # 第 10 欄＝RUN_ID（舊紀錄是已停用的 skipped 計數，找不到明細檔而已）。
         # legacy 這個變數是為了吃掉舊紀錄的第 11 欄，少讀會讓它被併進 status 造成錯亂。
         # shellcheck disable=SC2034
@@ -248,12 +281,51 @@ HTML_HEAD
             done < "$dfile"
             echo '</table></div></div></details>'
         done <<< "$rows"
+        # 一筆完整紀錄都還沒有，又不在執行中：給一句話，不要只留一個空表頭
+        if [ "$row_idx" = 0 ] && [ ! -f "$RUNNING_MARKER" ]; then
+            echo '<div class="nodet" style="padding:14px">尚無完整執行紀錄。</div>'
+        fi
         echo '</div></div></div>'
-        echo '<div class="foot">由 sync_archive.sh 自動產生　·　<strong>本頁只在每次執行完整收尾後才更新</strong>，搬移進行中不會看到半套數字<br>逐檔明細保留最近 '"$DETAIL_RUNS"' 次執行；更早的紀錄請見同目錄 sync_YYYY-MM-DD.log</div>'
+        echo '<div class="foot">由 sync_archive.sh 自動產生　·　執行一開跑就會多出一列 <strong>PROG</strong>（執行中，數字留白只跑耗時），<strong>正式數字要等該次完整收尾才寫入</strong>，不會看到半套數字<br>逐檔明細保留最近 '"$DETAIL_RUNS"' 次執行；更早的紀錄請見同目錄 sync_YYYY-MM-DD.log</div>'
+        # 只有執行中才輸出這段；平常的頁面維持零 JS
+        if [ -f "$RUNNING_MARKER" ]; then
+            cat <<'HTML_JS'
+<script>
+(function(){
+  var e=document.querySelector('.ela'); if(!e) return;
+  var s=parseInt(e.dataset.start,10); if(!s) return;
+  function tick(){
+    // clamp：瀏覽器時鐘比 NAS 慢時不要出現負數
+    var d=Math.max(0,Math.floor(Date.now()/1000-s)),h=Math.floor(d/3600),
+        m=Math.floor(d%3600/60),x=d%60;
+    e.textContent=h?h+'h'+m+'m'+x+'s':(m?m+'m'+x+'s':x+'s');
+  }
+  tick(); setInterval(tick,1000);
+})();
+</script>
+HTML_JS
+        fi
         echo '</body></html>'
     } > "$out_tmp" 2>/dev/null
     # 原子替換：讀取者只會看到舊版或新版，不會看到寫到一半的檔案
     mv -f "$out_tmp" "$SUMMARY_HTML" 2>/dev/null || rm -f "$out_tmp" 2>/dev/null
+}
+
+# 標記本次執行「進行中」並立刻重繪一次 —— 頁面因此在開跑當下就出現 PROG 列，
+# 看的人才分得出「腳本還在跑」與「排程根本沒觸發」。
+mark_running() {
+    printf '%s\t%s\t%s\t%s\n' "$RUN_ID" "$START_TS" "$$" "$DRY_RUN" \
+        > "$RUNNING_MARKER" 2>/dev/null && MARKED_RUNNING=1
+    render_summary_html
+}
+
+# 清掉執行中標記；有清到才回傳 0，讓呼叫端決定要不要重繪。
+# 只清自己寫的那份（見 MARKED_RUNNING 的說明）。
+finish_running_marker() {
+    [ "$MARKED_RUNNING" = 1 ] || return 1
+    MARKED_RUNNING=0
+    rm -f "$RUNNING_MARKER" 2>/dev/null
+    return 0
 }
 
 die()  {
@@ -265,8 +337,15 @@ die()  {
     fi
     exit 1
 }
-cleanup() { rm -f "$FILELIST" "$DETAIL_TMP" "$RSYNC_OUT" "$SUMMARY_HTML.tmp.$$" 2>/dev/null; }
+cleanup() {
+    rm -f "$FILELIST" "$DETAIL_TMP" "$RSYNC_OUT" "$SUMMARY_HTML.tmp.$$" 2>/dev/null
+    # 沒經過 append_summary 就結束（被中斷等）：撤掉 PROG 列，頁面退回上一次完整執行的結果
+    if finish_running_marker; then render_summary_html; fi
+}
 trap cleanup EXIT
+# 被中斷時只記一行 log 後 exit，清理與重繪交給上面的 EXIT trap；
+# 刻意不寫任何 summary.tsv 列 —— 沒跑完的執行不該留下一筆看似正式的紀錄。
+trap 'log "ABORT  收到中斷訊號，未完成本次執行"; exit 130' INT TERM HUP
 
 # 清理來源目錄：只針對「本輪搬移檔案的上層目錄（含其祖先）」嘗試 rmdir。
 # rmdir 只在目錄確實空了才會成功，所以不會誤刪 IPCAM 仍在使用、或跨日剛建立
@@ -325,6 +404,9 @@ RET_CUTOFF="$(date -d "@$(( START_TS - (RETENTION_DAYS + 1) * 86400 ))" '+%Y-%m-
 [ -n "$RET_CUTOFF" ] || die "無法計算保留基準（date -d 不支援？）"
 
 log "START  src=$SRC dst=$DST dry_run=$DRY_RUN 封存基準=<$CUTOFF 之前> retention=${RETENTION_DAYS}d 保留基準=<$RET_CUTOFF 之前刪>"
+
+# 鎖已取得、基準日已算好，這裡就把頁面標成執行中（含來源掛掉那種慢路徑也涵蓋得到）
+mark_running
 
 # --- 前置健康檢查 -------------------------------------------------------------
 # 來源的問題「只」讓封存階段停擺，不影響 NAS 端的保留期清理 ——
