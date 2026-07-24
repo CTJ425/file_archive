@@ -141,8 +141,13 @@ append_summary() {
     render_summary_html
 }
 
-# HTML 逸出：路徑可能含 & < > 等字元，直接塞進 HTML 會破壞版面甚至截斷內容
-html_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+# HTML 逸出：路徑可能含 & < > 等字元，直接塞進 HTML 會破壞版面甚至截斷內容。
+# 引號也要逸出 —— 狀態訊息（含來源路徑）會放進 title="..." 屬性，路徑裡一個雙引號
+# 就能提前結束屬性。文字節點裡的 &quot; / &#39; 瀏覽器一樣顯示成原字元，不影響閱讀。
+html_escape() {
+    sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' -e "s/'/\&#39;/g"
+}
 
 # 由 SUMMARY_TSV 產生自足（inline CSS、支援深/淺色）的 summary_time.html
 #
@@ -171,10 +176,14 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);font-size:13px;margin-bot
 .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow:hidden;max-width:1040px;margin:0 auto}
 .wrap{overflow-x:auto}
 .grid{min-width:900px}
-/* 第一欄用 minmax(...,1fr)：固定 165px 放不下「▸ 2026-07-24 22:14:39」會被截成「…」，
-   而各欄合計 779px < min-width 900px，多出來的空間本來沒有任何欄位會吃掉 */
-.row{display:grid;grid-template-columns:minmax(185px,1fr) 108px 88px 96px 88px 96px 66px 72px;
-     align-items:center;gap:0;font-size:14px}
+/* 每欄都給「最小寬度 + fr 比例」：最小寬度保證內容放得下（例如第一欄要容得下
+   「▸ 2026-07-24 22:14:39」約 185px），剩餘空間再按比例分給各欄，卡片內不會留下
+   沒人吃的空白，也不會像全塞給單一欄那樣把時間欄拉得過寬。狀態欄比例給大一點，
+   因為 ERROR 的訊息最長。 */
+.row{display:grid;font-size:14px;align-items:center;gap:0;
+     grid-template-columns:minmax(185px,1.5fr) minmax(120px,1.4fr) minmax(88px,1fr)
+                           minmax(96px,1fr) minmax(88px,1fr) minmax(96px,1fr)
+                           minmax(66px,.8fr) minmax(72px,.8fr)}
 .row>span{padding:10px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .row>span.num{text-align:right;font-variant-numeric:tabular-nums}
 .hdr{background:var(--hd);color:var(--mut);font-weight:600;border-bottom:1px solid var(--bd);
@@ -202,7 +211,10 @@ details.run[open] .caret{transform:rotate(90deg)}
 .a-dl{color:var(--err);background:color-mix(in srgb,var(--err) 14%,transparent)}
 .a-tr{color:var(--dry);background:color-mix(in srgb,var(--dry) 14%,transparent)}
 .nodet{color:var(--mut);font-size:12.5px;padding:10px 2px}
-.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600}
+/* ERROR 的訊息可能很長（含路徑）。max-width+ellipsis 讓它在欄內收成「…」，
+   而不是被外層 overflow:hidden 硬切成半個字；完整內容放在 title，滑過去看得到 */
+.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:12px;font-weight:600;
+       max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}
 .b-ok{color:var(--ok);background:color-mix(in srgb,var(--ok) 15%,transparent)}
 .b-err{color:var(--err);background:color-mix(in srgb,var(--err) 15%,transparent)}
 .b-dry{color:var(--dry);background:color-mix(in srgb,var(--dry) 15%,transparent)}
@@ -255,10 +267,12 @@ HTML_HEAD
             dfile="$DETAIL_DIR/$runid.tsv"
             [ -n "$runid" ] && [ "$row_idx" -le "$DETAIL_RUNS" ] && [ -s "$dfile" ] && has_det=1
 
-            local cells
-            cells="$(printf '<span>%s%s</span><span><span class="badge %s">%s</span></span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%ss</span>' \
+            # 逸出一次就好：同時當徽章文字與 title（長訊息在欄內收成「…」時靠 title 看全文）
+            local cells esc_label
+            esc_label="$(printf '%s' "$label" | html_escape)"
+            cells="$(printf '<span>%s%s</span><span><span class="badge %s" title="%s">%s</span></span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%s</span><span class="num">%ss</span>' \
                 "$([ "$has_det" = 1 ] && printf '<span class="caret">&#9656;</span> ' || printf '<span class="caret"></span> ')" \
-                "$dt" "$cls" "$(printf '%s' "$label" | html_escape)" \
+                "$dt" "$cls" "$esc_label" "$esc_label" \
                 "$mc" "$(human "$mb")" "$dc" "$(human "$db")" "$rc" "$dur")"
 
             if [ "$has_det" = 0 ]; then
