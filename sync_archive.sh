@@ -171,7 +171,9 @@ h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);font-size:13px;margin-bot
 .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;overflow:hidden;max-width:1040px;margin:0 auto}
 .wrap{overflow-x:auto}
 .grid{min-width:900px}
-.row{display:grid;grid-template-columns:165px 108px 88px 96px 88px 96px 66px 72px;
+/* 第一欄用 minmax(...,1fr)：固定 165px 放不下「▸ 2026-07-24 22:14:39」會被截成「…」，
+   而各欄合計 779px < min-width 900px，多出來的空間本來沒有任何欄位會吃掉 */
+.row{display:grid;grid-template-columns:minmax(185px,1fr) 108px 88px 96px 88px 96px 66px 72px;
      align-items:center;gap:0;font-size:14px}
 .row>span{padding:10px 12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .row>span.num{text-align:right;font-variant-numeric:tabular-nums}
