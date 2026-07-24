@@ -152,13 +152,26 @@ trap cleanup EXIT
 # 清理來源目錄：只針對「本輪搬移檔案的上層目錄（含其祖先）」嘗試 rmdir。
 # rmdir 只在目錄確實空了才會成功，所以不會誤刪 IPCAM 仍在使用、或跨日剛建立
 # 但尚未寫入的資料夾 —— 舊版的 find -type d -empty -delete 會無差別刪光。
-# 反向排序讓子目錄先於父目錄處理，巢狀空目錄一次清乾淨；來源根目錄永不觸及。
+# 反向排序讓子目錄先於父目錄處理，巢狀空目錄一次清乾淨。
+#
+# 兩層保護，缺一不可：
+#   1. 來源根目錄 $SRC 永不觸及。
+#   2. $SRC 底下第一層目錄（Enter_Leave / Enter_Leave_Records / ... 這類由
+#      IPCAM 軟體建立的固定分類資料夾）一律保留。整個分類被搬空時，若放任
+#      往上 rmdir 會把這些固定資料夾一起刪掉，攝影機下次要寫入就沒地方放。
+#      只清第二層以下的日期資料夾這種本來就會輪替的目錄。
+# 註：若來源結構是 $SRC/<日期>/檔案（日期就在第一層），日期資料夾會被保留、
+#     不會清除，寧可留下空目錄也不動可能是固定結構的東西。
 prune_moved_src_dirs() {
-    local f d
+    local f d rel
     while IFS= read -r -d '' f; do
         d="${f%/*}"
         while [ -n "$d" ] && [ "$d" != "." ] && [ "$d" != "$f" ]; do
-            printf '%s\0' "$d"
+            rel="${d#./}"
+            case "$rel" in
+                */*) printf '%s\0' "$d" ;;   # 第二層以下，可清
+                *)   break ;;                # 第一層固定分類資料夾，保留
+            esac
             d="${d%/*}"
         done
     done < "$FILELIST" | sort -z -u -r | while IFS= read -r -d '' d; do

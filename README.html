@@ -81,6 +81,7 @@ NAS 上<strong>超過一年</strong>的舊檔。每次執行寫入每日封存 l
 <li><strong>保留一年</strong>：只在 NAS 本機封存目錄 <code>$DST</code> 上 <code>find -mtime +RETENTION_DAYS -delete</code>，
 以檔案<strong>原始 mtime</strong> 為準（rsync <code>-a</code> 會保留原始時間）。<span class="warn">絕不對來源執行刪除。</span></li>
 <li><strong>過舊來源檔不搬也不刪</strong>：來源上 mtime 已超過 <code>RETENTION_DAYS</code> 的檔（搬過去也會在同一輪被保留期立刻刪掉，等於來源與封存同時消失），一律<strong>原地保留在來源</strong>，只在 log 記 <code>SKIPOLD</code> 並於摘要顯示「跳過(過舊)」筆數，交由人工判斷要保存還是自行清除。搬移清單與保留刪除使用<strong>同一個 <code>-mtime +RETENTION_DAYS</code> 判斷式</strong>，邊界保證一致。</li>
+<li><strong>來源空目錄只做精準清理</strong>：只對「本輪確實被搬空的目錄」由深至淺 <code>rmdir</code>（非空自然失敗），且 <strong><code>$SRC</code> 底下第一層的固定分類資料夾一律保留</strong>。整個分類被搬空時若放任往上刪，<code>Enter_Leave/</code>、<code>Enter_Leave_Records/</code> 這類由 IPCAM 軟體建立的固定資料夾會被一起刪掉，攝影機下次要寫入就沒地方放。跨日剛建立、尚未寫入的日期資料夾也因為「本輪沒搬過」而不受影響。</li>
 <li><strong>健康檢查</strong>：CIFS 未掛載即中止並記 ERROR；且因搬移是「傳成功才刪來源」，就算來源異常最糟也只是該次不搬。</li>
 <li><strong>防重疊</strong>：flock 單一實例鎖。</li>
 </ul>
