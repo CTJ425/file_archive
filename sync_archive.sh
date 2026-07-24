@@ -34,6 +34,11 @@ fi
 # shellcheck source=/dev/null
 . "$CONF"
 
+# 去掉路徑尾端斜線：mountpoint 不在時的 fallback 是比對 `mount` 輸出的
+# " on <路徑> "，帶尾斜線會比不到而誤判成「未掛載」。
+while [ "$SRC" != "/" ] && [ "${SRC%/}" != "$SRC" ]; do SRC="${SRC%/}"; done
+while [ "$DST" != "/" ] && [ "${DST%/}" != "$DST" ]; do DST="${DST%/}"; done
+
 # 設定必要變數的預設值（設定檔未定義時的保險）
 : "${ARCHIVE_BEFORE_DAYS_AGO:=0}"
 : "${RETENTION_DAYS:=365}"
@@ -48,9 +53,11 @@ SUMMARY_TSV="$LOG_DIR/summary.tsv"
 SUMMARY_HTML="$LOG_DIR/summary_time.html"
 LOCKFILE="$LOG_DIR/.sync_archive.lock"
 FILELIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive.XXXXXX")"
+SKIPLIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive_skip.XXXXXX")"
 
 # 供 summary 使用的全域統計（die 也會用到）
 MOVE_COUNT=0; MOVE_BYTES=0; DEL_COUNT=0; DEL_BYTES=0; RC=0
+SKIP_COUNT=0; SKIP_BYTES=0
 START_TS=$(date +%s)
 
 log()  { echo "$(date '+%F %T')  $*" >> "$LOG"; }
@@ -68,9 +75,11 @@ human() {
 append_summary() {
     local status="$1"
     local dur=$(( $(date +%s) - START_TS ))
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    # 跳過數放在 status 之後（第 10 欄），舊格式的 9 欄紀錄仍可正常讀取
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$(date '+%F %T')" "$MOVE_COUNT" "$MOVE_BYTES" \
         "$DEL_COUNT" "$DEL_BYTES" "$RC" "$dur" "$DRY_RUN" "$status" \
+        "$SKIP_COUNT" \
         >> "$SUMMARY_TSV" 2>/dev/null
     render_summary_html
 }
@@ -106,18 +115,21 @@ tr:last-child td{border-bottom:none}
 HTML_HEAD
         echo "<div class=\"sub\">最後更新：$(date '+%F %T')　·　來源 <code>${SRC}</code> → 封存 <code>${DST}</code>　·　顯示最近 200 筆</div>"
         echo '<div class="card"><div class="wrap"><table>'
-        echo '<thead><tr><th>執行時間</th><th>狀態</th><th class="num">搬移檔數</th><th class="num">搬移量</th><th class="num">刪除檔數</th><th class="num">釋放量</th><th class="num">rsync</th><th class="num">耗時</th></tr></thead><tbody>'
-        while IFS=$'\t' read -r dt mc mb dc db rc dur dry status; do
+        echo '<thead><tr><th>執行時間</th><th>狀態</th><th class="num">搬移檔數</th><th class="num">搬移量</th><th class="num">刪除檔數</th><th class="num">釋放量</th><th class="num">跳過(過舊)</th><th class="num">rsync</th><th class="num">耗時</th></tr></thead><tbody>'
+        while IFS=$'\t' read -r dt mc mb dc db rc dur dry status skipped; do
             [ -z "$dt" ] && continue
             local cls="b-ok" label="$status"
+            # 失敗優先判定：演練模式若 rsync 出錯，仍必須顯示成錯誤而非 DRYRUN
             case "$status" in
-                DRYRUN*) cls="b-dry";;
                 ERROR*|*rc=*) cls="b-err";;
-                OK*) cls="b-ok";;
+                DRYRUN*)      cls="b-dry";;
+                OK*)
+                    if [ "$dry" = 1 ]; then cls="b-dry"; label="DRYRUN"; else cls="b-ok"; fi
+                    ;;
             esac
-            [ "$dry" = 1 ] && { cls="b-dry"; [ "$label" = OK ] && label="DRYRUN"; }
-            printf '<tr><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%ss</td></tr>\n' \
-                "$dt" "$cls" "$label" "$mc" "$(human "$mb")" "$dc" "$(human "$db")" "$rc" "$dur"
+            printf '<tr><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%ss</td></tr>\n' \
+                "$dt" "$cls" "$label" "$mc" "$(human "$mb")" "$dc" "$(human "$db")" \
+                "${skipped:-0}" "$rc" "$dur"
         done <<< "$rows"
         echo '</tbody></table></div></div>'
         echo '<div class="foot">由 sync_archive.sh 自動產生　·　詳細逐檔紀錄請見同目錄 sync_YYYY-MM-DD.log</div>'
@@ -134,8 +146,25 @@ die()  {
     fi
     exit 1
 }
-cleanup() { rm -f "$FILELIST" 2>/dev/null; }
+cleanup() { rm -f "$FILELIST" "$SKIPLIST" 2>/dev/null; }
 trap cleanup EXIT
+
+# 清理來源目錄：只針對「本輪搬移檔案的上層目錄（含其祖先）」嘗試 rmdir。
+# rmdir 只在目錄確實空了才會成功，所以不會誤刪 IPCAM 仍在使用、或跨日剛建立
+# 但尚未寫入的資料夾 —— 舊版的 find -type d -empty -delete 會無差別刪光。
+# 反向排序讓子目錄先於父目錄處理，巢狀空目錄一次清乾淨；來源根目錄永不觸及。
+prune_moved_src_dirs() {
+    local f d
+    while IFS= read -r -d '' f; do
+        d="${f%/*}"
+        while [ -n "$d" ] && [ "$d" != "." ] && [ "$d" != "$f" ]; do
+            printf '%s\0' "$d"
+            d="${d%/*}"
+        done
+    done < "$FILELIST" | sort -z -u -r | while IFS= read -r -d '' d; do
+        rmdir "$SRC/$d" 2>/dev/null || true
+    done
+}
 
 # --- 單一實例鎖（flock，退化為 mkdir） ---------------------------------------
 if command -v flock >/dev/null 2>&1; then
@@ -174,9 +203,18 @@ rm -f "$_probe"
 # --- 搬移階段（安全 mv） ------------------------------------------------------
 cd "$SRC" || die "無法進入來源目錄: $SRC"
 
-# 只挑「mtime 早於基準日」的檔（! -newermt = 不比基準新 = 基準日之前）；排除暫存檔
-find . -type f ! -newermt "$CUTOFF" \
+# 待搬清單：mtime 早於基準日（! -newermt = 不比基準新 = 基準日之前），
+# 但還沒老到「一搬過去就會被保留期刪掉」；排除暫存檔。
+# 這裡的 -mtime +RETENTION_DAYS 與下方 $DST 保留刪除用的是同一個判斷式，
+# 確保兩者邊界一致 —— 否則超過保留期的檔會被搬到 $DST 後於同一輪立刻刪除，
+# 來源與封存同時消失，造成靜默的資料遺失。
+find . -type f ! -newermt "$CUTOFF" ! -mtime +"$RETENTION_DAYS" \
     ! -name '*.tmp' -print0 > "$FILELIST"
+
+# 過舊清單：只記錄與統計，不搬移也不刪除，原地留在來源等人工判斷。
+# （保留期刪除永遠只作用於 $DST，絕不對來源動刀）
+find . -type f ! -newermt "$CUTOFF" -mtime +"$RETENTION_DAYS" \
+    ! -name '*.tmp' -print0 > "$SKIPLIST"
 
 MOVE_COUNT=$(tr -cd '\0' < "$FILELIST" | wc -c)
 
@@ -186,7 +224,17 @@ while IFS= read -r -d '' f; do
     MOVE_BYTES=$(( MOVE_BYTES + sz ))
 done < "$FILELIST"
 
+while IFS= read -r -d '' f; do
+    sz=$(stat -c %s "$SRC/$f" 2>/dev/null || echo 0)
+    SKIP_COUNT=$(( SKIP_COUNT + 1 )); SKIP_BYTES=$(( SKIP_BYTES + sz ))
+    log "SKIPOLD $sz $f"
+done < "$SKIPLIST"
+
 log "SCAN   找到 $MOVE_COUNT 個符合基準的檔，共 $(human "$MOVE_BYTES")"
+if [ "$SKIP_COUNT" -gt 0 ]; then
+    log "WARN   另有 $SKIP_COUNT 個檔（$(human "$SKIP_BYTES")）mtime 已超過保留期 ${RETENTION_DAYS} 天，"
+    log "WARN   未搬移亦未刪除，原地保留於來源（搬過去也會立刻被保留期刪掉），請人工處理"
+fi
 
 if [ "$MOVE_COUNT" -gt 0 ]; then
     RSYNC_OPTS=(-a --from0 --files-from="$FILELIST" --out-format='MOVE %l %n')
@@ -204,7 +252,7 @@ if [ "$MOVE_COUNT" -gt 0 ]; then
     fi
 
     if [ "$DRY_RUN" != 1 ]; then
-        find "$SRC" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+        prune_moved_src_dirs
     fi
 fi
 
@@ -228,18 +276,20 @@ find "$LOG_DIR" -maxdepth 1 -name 'sync_*.log' -mtime +"$LOG_RETENTION_DAYS" -de
 
 # --- 收尾 summary（txt log + summary_time.html） -----------------------------
 DUR=$(( $(date +%s) - START_TS ))
-log "SUMMARY moved=$MOVE_COUNT movedBytes=$MOVE_BYTES deleted=$DEL_COUNT deletedBytes=$DEL_BYTES rsync_rc=$RC dur=${DUR}s dry_run=$DRY_RUN"
+log "SUMMARY moved=$MOVE_COUNT movedBytes=$MOVE_BYTES deleted=$DEL_COUNT deletedBytes=$DEL_BYTES skippedOld=$SKIP_COUNT skippedBytes=$SKIP_BYTES rsync_rc=$RC dur=${DUR}s dry_run=$DRY_RUN"
 
-if [ "$DRY_RUN" = 1 ]; then
-    append_summary "DRYRUN"
-elif [ "$RC" -ne 0 ]; then
+# rsync 失敗優先於 DRY_RUN 判定：演練的目的就是在上線前抓出環境問題
+# （例如缺 rsync 會得到 rc=127），若一律記成 DRYRUN 並 exit 0 就驗不出來。
+if [ "$RC" -ne 0 ]; then
     append_summary "ERROR: rsync rc=$RC"
+elif [ "$DRY_RUN" = 1 ]; then
+    append_summary "DRYRUN"
 else
     append_summary "OK"
 fi
 
-if [ "$RC" -ne 0 ] && [ "$DRY_RUN" != 1 ]; then
-    if [ "$NOTIFY_ON_ERROR" = 1 ] && [ -x /usr/syno/bin/synonotify ]; then
+if [ "$RC" -ne 0 ]; then
+    if [ "$NOTIFY_ON_ERROR" = 1 ] && [ "$DRY_RUN" != 1 ] && [ -x /usr/syno/bin/synonotify ]; then
         /usr/syno/bin/synonotify "SYNOScheduledTaskComplete" \
             "{\"%TASKNAME%\":\"sync_archive\",\"%STATUS%\":\"rsync rc=$RC\"}" 2>/dev/null || true
     fi
