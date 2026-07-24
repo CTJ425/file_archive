@@ -20,6 +20,7 @@ body{margin:0;background:var(--bg);color:var(--fg);
 .wrap{max-width:860px;margin:0 auto;padding:32px 20px 64px}
 h1{font-size:26px;margin:0 0 6px;line-height:1.3}
 h2{font-size:20px;margin:34px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--bd)}
+h3{font-size:17px;margin:24px 0 8px}
 .lead{color:var(--mut);font-size:15px;margin:0 0 8px}
 p{margin:10px 0}
 code{background:var(--code-bg);border:1px solid var(--bd);border-radius:5px;
@@ -276,6 +277,21 @@ DELETE 1048576  /volume1/archive/2025/.../old.mp4
 <tr><td><code>NOTIFY_ON_ERROR</code></td><td>1</td><td>失敗時發 DSM 通知</td></tr>
 <tr><td><code>REQUIRE_MOUNTPOINT</code></td><td>0</td><td>1＝要求 <code>SRC</code> 必須是掛載點（CIFS 部署建議開）；0＝允許本機資料夾</td></tr>
 </table>
+
+<h3><code>ARCHIVE_BEFORE_DAYS_AGO</code> 的實際效果（實測對照）</h3>
+<p>以「今天 = 2026-07-24」、來源有 07-21～07-24 各一個檔為例：</p>
+<table>
+<tr><th>設定</th><th>封存基準</th><th>搬走</th><th>留在來源</th></tr>
+<tr><td><code>0</code>（預設）</td><td><code>2026-07-24 00:00</code></td><td>07-23、07-22、07-21</td><td><strong>今天</strong></td></tr>
+<tr><td><code>1</code></td><td><code>2026-07-23 00:00</code></td><td>07-22、07-21</td><td><strong>今天＋昨天</strong></td></tr>
+<tr><td><code>3</code></td><td><code>2026-07-21 00:00</code></td><td>07-20</td><td><strong>今天～前 3 天</strong></td></tr>
+</table>
+<p><code>=1</code> 就是「多留昨天一天」，用在來源端有跨日補寫或後製流程、怕昨天的檔還沒完全寫完的情況。</p>
+<ul>
+<li><strong>剛好落在基準時刻的檔會被搬走</strong>：判定是 <code>! -newermt</code>（不比基準新，即 <code>mtime &lt;= 基準</code>），所以 mtime 正好是 <code>07-23 00:00:00</code> 的檔在 <code>=1</code> 時會被搬走。嚴格講「保留昨天」是「保留昨天 <code>00:00:00</code> <strong>之後</strong>」——要剛好卡在午夜零秒才會遇到，實務上碰不到。</li>
+<li><strong>只影響封存階段，與保留期無關</strong>：刪除與否是 <code>RETENTION_DAYS</code> 在 <code>$DST</code> 上獨立決定的。調大這個值只是讓檔案晚幾天搬上 NAS，<strong>不會</strong>讓它們晚幾天被刪——保留期以檔案自己的 mtime 計算。</li>
+<li><strong>填錯值的行為</strong>：非數字（例如 <code>abc</code>）會讓 <code>date</code> 解析失敗，腳本直接以「無法計算基準日」中止並回傳 <code>1</code>，不會靜默亂搬；負數會被 GNU <code>date</code> 當成正數處理（<code>-1</code> 與 <code>1</code> 都得到同一個基準），<strong>不會</strong>產生未來日期而把今天正在寫入的檔掃走。</li>
+</ul>
 
 </div>
 </body>
