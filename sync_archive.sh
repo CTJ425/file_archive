@@ -54,6 +54,14 @@ while [ "$DST" != "/" ] && [ "${DST%/}" != "$DST" ]; do DST="${DST%/}"; done
 : "${DRY_RUN:=0}"
 : "${NOTIFY_ON_ERROR:=0}"
 : "${REQUIRE_MOUNTPOINT:=0}"
+: "${OVER_RETENTION_POLICY:=keep}"
+
+# 來源上「搬過去也已超過保留期」的檔案要怎麼處理（三選一）
+case "$OVER_RETENTION_POLICY" in
+    keep|archive|skip) ;;
+    *) echo "ERROR: OVER_RETENTION_POLICY 只能是 keep / archive / skip，目前為: $OVER_RETENTION_POLICY" >&2
+       exit 2 ;;
+esac
 
 # --- 準備 log 與統計變數 ------------------------------------------------------
 mkdir -p "$LOG_DIR" 2>/dev/null
@@ -62,11 +70,18 @@ SUMMARY_TSV="$LOG_DIR/summary.tsv"
 SUMMARY_HTML="$LOG_DIR/summary_time.html"
 LOCKFILE="$LOG_DIR/.sync_archive.lock"
 FILELIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive.XXXXXX")"
-SKIPLIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive_skip.XXXXXX")"
+OLDLIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive_old.XXXXXX")"
+RSYNCLIST="$(mktemp "${TMPDIR:-/tmp}/sync_archive_rsync.XXXXXX")"
+
+# 豁免保留期刪除的清單（相對 $DST 的路徑，NUL 分隔）。
+# 刻意放在 $DST 內而非 LOG_DIR：這份紀錄必須與封存資料同生共死 —— 若放 log 目錄
+# 而被清掉，那些「刻意永久保留」的檔案會在下一輪被保留期靜默刪除。
+KEEP_LEDGER="$DST/.keepold.list"
 
 # 供 summary 使用的全域統計（die 也會用到）
 MOVE_COUNT=0; MOVE_BYTES=0; DEL_COUNT=0; DEL_BYTES=0; RC=0
-SKIP_COUNT=0; SKIP_BYTES=0
+SKIP_COUNT=0; SKIP_BYTES=0; KEEP_COUNT=0; KEEP_BYTES=0
+OLD_COUNT=0; OLD_BYTES=0
 START_TS=$(date +%s)
 
 log()  { echo "$(date '+%F %T')  $*" >> "$LOG"; }
@@ -84,11 +99,12 @@ human() {
 append_summary() {
     local status="$1"
     local dur=$(( $(date +%s) - START_TS ))
-    # 跳過數放在 status 之後（第 10 欄），舊格式的 9 欄紀錄仍可正常讀取
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    # 新欄位一律追加在 status 之後（跳過=第10欄、豁免=第11欄），
+    # 舊格式的 9 / 10 欄紀錄仍可正常讀取
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
         "$(date '+%F %T')" "$MOVE_COUNT" "$MOVE_BYTES" \
         "$DEL_COUNT" "$DEL_BYTES" "$RC" "$dur" "$DRY_RUN" "$status" \
-        "$SKIP_COUNT" \
+        "$SKIP_COUNT" "$KEEP_COUNT" \
         >> "$SUMMARY_TSV" 2>/dev/null
     render_summary_html
 }
@@ -124,8 +140,8 @@ tr:last-child td{border-bottom:none}
 HTML_HEAD
         echo "<div class=\"sub\">最後更新：$(date '+%F %T')　·　來源 <code>${SRC}</code> → 封存 <code>${DST}</code>　·　顯示最近 200 筆</div>"
         echo '<div class="card"><div class="wrap"><table>'
-        echo '<thead><tr><th>執行時間</th><th>狀態</th><th class="num">搬移檔數</th><th class="num">搬移量</th><th class="num">刪除檔數</th><th class="num">釋放量</th><th class="num">跳過(過舊)</th><th class="num">rsync</th><th class="num">耗時</th></tr></thead><tbody>'
-        while IFS=$'\t' read -r dt mc mb dc db rc dur dry status skipped; do
+        echo '<thead><tr><th>執行時間</th><th>狀態</th><th class="num">搬移檔數</th><th class="num">搬移量</th><th class="num">刪除檔數</th><th class="num">釋放量</th><th class="num">跳過(過舊)</th><th class="num">豁免保留</th><th class="num">rsync</th><th class="num">耗時</th></tr></thead><tbody>'
+        while IFS=$'\t' read -r dt mc mb dc db rc dur dry status skipped kept; do
             [ -z "$dt" ] && continue
             local cls="b-ok" label="$status"
             # 失敗優先判定：演練模式若 rsync 出錯，仍必須顯示成錯誤而非 DRYRUN
@@ -136,9 +152,9 @@ HTML_HEAD
                     if [ "$dry" = 1 ]; then cls="b-dry"; label="DRYRUN"; else cls="b-ok"; fi
                     ;;
             esac
-            printf '<tr><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%ss</td></tr>\n' \
+            printf '<tr><td>%s</td><td><span class="badge %s">%s</span></td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%s</td><td class="num">%ss</td></tr>\n' \
                 "$dt" "$cls" "$label" "$mc" "$(human "$mb")" "$dc" "$(human "$db")" \
-                "${skipped:-0}" "$rc" "$dur"
+                "${skipped:-0}" "${kept:-0}" "$rc" "$dur"
         done <<< "$rows"
         echo '</tbody></table></div></div>'
         echo '<div class="foot">由 sync_archive.sh 自動產生　·　詳細逐檔紀錄請見同目錄 sync_YYYY-MM-DD.log</div>'
@@ -155,8 +171,29 @@ die()  {
     fi
     exit 1
 }
-cleanup() { rm -f "$FILELIST" "$SKIPLIST" 2>/dev/null; }
+cleanup() { rm -f "$FILELIST" "$OLDLIST" "$RSYNCLIST" 2>/dev/null; }
 trap cleanup EXIT
+
+# 更新豁免清單：把本輪新封存的過舊檔加進去，並剔除已不存在於 $DST 的項目
+# （檔案被人工刪除後就不需要再記，避免清單無限增長）。
+update_keep_ledger() {
+    local tmp p
+    tmp="$(mktemp "${TMPDIR:-/tmp}/sync_keepold.XXXXXX")" || return 0
+    {
+        [ -f "$KEEP_LEDGER" ] && cat "$KEEP_LEDGER"
+        if [ "$OVER_RETENTION_POLICY" = keep ]; then
+            while IFS= read -r -d '' p; do printf '%s\0' "${p#./}"; done < "$OLDLIST"
+        fi
+    } | sort -z -u | while IFS= read -r -d '' p; do
+        [ -e "$DST/$p" ] && printf '%s\0' "$p"
+    done > "$tmp"
+    # 沒有任何豁免項就不要在封存目錄留下空檔案
+    if [ -s "$tmp" ]; then
+        mv -f "$tmp" "$KEEP_LEDGER" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp" "$KEEP_LEDGER" 2>/dev/null
+    fi
+}
 
 # 清理來源目錄：只針對「本輪搬移檔案的上層目錄（含其祖先）」嘗試 rmdir。
 # rmdir 只在目錄確實空了才會成功，所以不會誤刪 IPCAM 仍在使用、或跨日剛建立
@@ -183,7 +220,7 @@ prune_moved_src_dirs() {
             esac
             d="${d%/*}"
         done
-    done < "$FILELIST" | sort -z -u -r | while IFS= read -r -d '' d; do
+    done < "$RSYNCLIST" | sort -z -u -r | while IFS= read -r -d '' d; do
         rmdir "$SRC/$d" 2>/dev/null || true
     done
 }
@@ -240,41 +277,65 @@ rm -f "$_probe"
 # --- 搬移階段（安全 mv） ------------------------------------------------------
 cd "$SRC" || die "無法進入來源目錄: $SRC"
 
-# 待搬清單：mtime 早於基準日（! -newermt = 不比基準新 = 基準日之前），
-# 但還沒老到「一搬過去就會被保留期刪掉」；排除暫存檔。
-# 這裡與下方 $DST 保留刪除用的是同一個定格的 $RET_CUTOFF，
-# 確保兩者邊界一致 —— 否則超過保留期的檔會被搬到 $DST 後於同一輪立刻刪除，
-# 來源與封存同時消失，造成靜默的資料遺失。
+# 一般待搬清單：mtime 早於基準日（! -newermt = 不比基準新 = 基準日之前），
+# 且尚未超過保留期；排除暫存檔。
 find . -type f ! -newermt "$CUTOFF" -newermt "$RET_CUTOFF" \
     ! -name '*.tmp' -print0 > "$FILELIST"
 
-# 過舊清單：只記錄與統計，不搬移也不刪除，原地留在來源等人工判斷。
-# （保留期刪除永遠只作用於 $DST，絕不對來源動刀）
+# 過舊清單：早於基準日、且已超過保留期的檔。與上面用的是同一個定格的
+# $RET_CUTOFF，兩份清單保證互斥且無縫接合，不會漏檔也不會重複。
 find . -type f ! -newermt "$CUTOFF" ! -newermt "$RET_CUTOFF" \
-    ! -name '*.tmp' -print0 > "$SKIPLIST"
+    ! -name '*.tmp' -print0 > "$OLDLIST"
 
-MOVE_COUNT=$(tr -cd '\0' < "$FILELIST" | wc -c)
-
-# 先加總待搬位元組（此時來源檔仍在）
+# 統計待搬位元組（此時來源檔仍在）
 while IFS= read -r -d '' f; do
     sz=$(stat -c %s "$SRC/$f" 2>/dev/null || echo 0)
     MOVE_BYTES=$(( MOVE_BYTES + sz ))
 done < "$FILELIST"
+MOVE_COUNT=$(tr -cd '\0' < "$FILELIST" | wc -c)
 
 while IFS= read -r -d '' f; do
     sz=$(stat -c %s "$SRC/$f" 2>/dev/null || echo 0)
-    SKIP_COUNT=$(( SKIP_COUNT + 1 )); SKIP_BYTES=$(( SKIP_BYTES + sz ))
-    log "SKIPOLD $sz $f"
-done < "$SKIPLIST"
+    OLD_COUNT=$(( OLD_COUNT + 1 )); OLD_BYTES=$(( OLD_BYTES + sz ))
+done < "$OLDLIST"
 
 log "SCAN   找到 $MOVE_COUNT 個符合基準的檔，共 $(human "$MOVE_BYTES")"
-if [ "$SKIP_COUNT" -gt 0 ]; then
-    log "WARN   另有 $SKIP_COUNT 個檔（$(human "$SKIP_BYTES")）mtime 已超過保留期 ${RETENTION_DAYS} 天，"
-    log "WARN   未搬移亦未刪除，原地保留於來源（搬過去也會立刻被保留期刪掉），請人工處理"
+
+# 依政策決定過舊檔的去向，並組出真正要交給 rsync 的清單
+cp "$FILELIST" "$RSYNCLIST" 2>/dev/null
+if [ "$OLD_COUNT" -gt 0 ]; then
+    case "$OVER_RETENTION_POLICY" in
+        keep)
+            # 搬到 $DST 並登記豁免，往後的保留期刪除不會碰它們
+            cat "$OLDLIST" >> "$RSYNCLIST"
+            KEEP_COUNT="$OLD_COUNT"; KEEP_BYTES="$OLD_BYTES"
+            MOVE_COUNT=$(( MOVE_COUNT + OLD_COUNT )); MOVE_BYTES=$(( MOVE_BYTES + OLD_BYTES ))
+            while IFS= read -r -d '' f; do
+                log "KEEPOLD $(stat -c %s "$SRC/$f" 2>/dev/null || echo 0) $f"
+            done < "$OLDLIST"
+            log "INFO   上列 $KEEP_COUNT 個檔（$(human "$KEEP_BYTES")）mtime 已超過保留期 ${RETENTION_DAYS} 天，"
+            log "INFO   仍搬移封存並登記於 ${KEEP_LEDGER##*/}，永久豁免保留期刪除（NAS 容量請自行留意）"
+            ;;
+        archive)
+            # 當成一般檔搬移，之後由保留期正常刪除
+            cat "$OLDLIST" >> "$RSYNCLIST"
+            MOVE_COUNT=$(( MOVE_COUNT + OLD_COUNT )); MOVE_BYTES=$(( MOVE_BYTES + OLD_BYTES ))
+            log "INFO   含 $OLD_COUNT 個已超過保留期的檔（$(human "$OLD_BYTES")），搬移後將由保留期刪除"
+            ;;
+        skip)
+            # 不搬也不刪，原地留在來源等人工判斷
+            SKIP_COUNT="$OLD_COUNT"; SKIP_BYTES="$OLD_BYTES"
+            while IFS= read -r -d '' f; do
+                log "SKIPOLD $(stat -c %s "$SRC/$f" 2>/dev/null || echo 0) $f"
+            done < "$OLDLIST"
+            log "WARN   另有 $SKIP_COUNT 個檔（$(human "$SKIP_BYTES")）mtime 已超過保留期 ${RETENTION_DAYS} 天，"
+            log "WARN   未搬移亦未刪除，原地保留於來源（搬過去也會立刻被保留期刪掉），請人工處理"
+            ;;
+    esac
 fi
 
 if [ "$MOVE_COUNT" -gt 0 ]; then
-    RSYNC_OPTS=(-a --from0 --files-from="$FILELIST" --out-format='MOVE %l %n')
+    RSYNC_OPTS=(-a --from0 --files-from="$RSYNCLIST" --out-format='MOVE %l %n')
     if [ "$DRY_RUN" = 1 ]; then
         RSYNC_OPTS+=(--dry-run)
         log "DRYRUN 以下為將搬移清單（未實際搬移/刪除）"
@@ -293,27 +354,46 @@ if [ "$MOVE_COUNT" -gt 0 ]; then
     fi
 fi
 
-# --- 保留階段（只對 $DST，依原始 mtime；用定格的 $RET_CUTOFF，與搬移清單同基準）
-if [ "$DRY_RUN" = 1 ]; then
-    log "DRYRUN 以下為將刪除（>${RETENTION_DAYS}天）清單（未實際刪除）"
-    while IFS=' ' read -r sz path; do
-        log "DELETE $sz $path"
-        DEL_COUNT=$(( DEL_COUNT + 1 )); DEL_BYTES=$(( DEL_BYTES + sz ))
-    done < <(find "$DST" -type f ! -newermt "$RET_CUTOFF" -printf '%s %p\n' 2>/dev/null)
-else
-    while IFS=' ' read -r sz path; do
-        log "DELETE $sz $path"
-        DEL_COUNT=$(( DEL_COUNT + 1 )); DEL_BYTES=$(( DEL_BYTES + sz ))
-    done < <(find "$DST" -type f ! -newermt "$RET_CUTOFF" -printf '%s %p\n' -delete 2>/dev/null)
-    find "$DST" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+# 更新豁免清單（演練不寫入）。即使本輪沒有新的過舊檔也要跑，才能剔除
+# 已被人工刪除的項目，避免清單無限增長。
+if [ "$DRY_RUN" != 1 ]; then
+    update_keep_ledger
 fi
+
+# --- 保留階段（只對 $DST，依原始 mtime；用定格的 $RET_CUTOFF，與搬移清單同基準）
+# 載入豁免清單：登記在案的檔案永久保留，不受保留期刪除。
+declare -A KEEPSET=()
+if [ -f "$KEEP_LEDGER" ]; then
+    while IFS= read -r -d '' _p; do KEEPSET["$_p"]=1; done < "$KEEP_LEDGER"
+fi
+
+[ "$DRY_RUN" = 1 ] && log "DRYRUN 以下為將刪除（>${RETENTION_DAYS}天）清單（未實際刪除）"
+
+# 逐筆判定後才刪，才有機會跳過豁免項；清單檔本身也排除在候選之外。
+EXEMPT_COUNT=0
+while IFS= read -r -d '' _rec; do
+    sz="${_rec%%	*}"; rel="${_rec#*	}"
+    if [ -n "${KEEPSET[$rel]:-}" ]; then
+        EXEMPT_COUNT=$(( EXEMPT_COUNT + 1 ))
+        continue
+    fi
+    log "DELETE $sz $DST/$rel"
+    DEL_COUNT=$(( DEL_COUNT + 1 )); DEL_BYTES=$(( DEL_BYTES + sz ))
+    [ "$DRY_RUN" = 1 ] || rm -f "$DST/$rel" 2>/dev/null
+done < <(find "$DST" -type f ! -newermt "$RET_CUTOFF" \
+             ! -path "$KEEP_LEDGER" -printf '%s\t%P\0' 2>/dev/null)
+
+if [ "$EXEMPT_COUNT" -gt 0 ]; then
+    log "INFO   $EXEMPT_COUNT 個已超過保留期的檔登記於豁免清單，予以保留未刪除"
+fi
+[ "$DRY_RUN" = 1 ] || find "$DST" -mindepth 1 -type d -empty -delete 2>/dev/null || true
 
 # --- log 自我歸檔清理 ---------------------------------------------------------
 find "$LOG_DIR" -maxdepth 1 -name 'sync_*.log' -mtime +"$LOG_RETENTION_DAYS" -delete 2>/dev/null || true
 
 # --- 收尾 summary（txt log + summary_time.html） -----------------------------
 DUR=$(( $(date +%s) - START_TS ))
-log "SUMMARY moved=$MOVE_COUNT movedBytes=$MOVE_BYTES deleted=$DEL_COUNT deletedBytes=$DEL_BYTES skippedOld=$SKIP_COUNT skippedBytes=$SKIP_BYTES rsync_rc=$RC dur=${DUR}s dry_run=$DRY_RUN"
+log "SUMMARY moved=$MOVE_COUNT movedBytes=$MOVE_BYTES deleted=$DEL_COUNT deletedBytes=$DEL_BYTES skippedOld=$SKIP_COUNT skippedBytes=$SKIP_BYTES keptOld=$KEEP_COUNT keptBytes=$KEEP_BYTES rsync_rc=$RC dur=${DUR}s dry_run=$DRY_RUN"
 
 # rsync 失敗優先於 DRY_RUN 判定：演練的目的就是在上線前抓出環境問題
 # （例如缺 rsync 會得到 rc=127），若一律記成 DRYRUN 並 exit 0 就驗不出來。
